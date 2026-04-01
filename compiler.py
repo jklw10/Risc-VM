@@ -10,7 +10,6 @@ class SymbolInfo:
     offset_from_base: int  
     is_function: bool = False
     arg_count: int = 0
-    # Store Loop inside the Scope logic
     is_loop: bool = False
     label: str = ""
     l_start: str = ""
@@ -76,7 +75,6 @@ class Compiler:
         l_next  = self.get_unique_label(f"{label_name}_next")
         l_end   = self.get_unique_label(f"{label_name}_end")
         
-        # Saves explicitly in scopes directly.
         loop_info = SymbolInfo(
             offset_from_base=0, 
             is_function=False, 
@@ -121,24 +119,35 @@ class Compiler:
         if not target_loop: 
             raise ValueError(f"Loop label {node.identifier} not found!")
 
+        target_depth = target_loop.var_offset + 4 
+        diff = self.current_stack_depth - target_depth
+
         cmd = node.args[0]
         if cmd == "end":
+            if diff > 0: asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
             asm.jal(macros.x0, target_loop.l_end)
         elif cmd == "next":
+            if diff > 0: asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
             asm.jal(macros.x0, target_loop.l_next)
         elif cmd == "expr":
             self._compile_expr(node.children[0].expr)
             macros.pop(macros.t0)
             self.current_stack_depth -= 4
             
-            offset = target_loop.var_offset - self.current_stack_depth
-            asm.store(macros.stack_ptr, offset, macros.t0)
+            if diff > 0: asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
             
+            # Write new value cleanly back to index variable
+            asm.store(macros.stack_ptr, -4, macros.t0)
             asm.jal(macros.x0, target_loop.l_start)
 
     def Return(self, node):
         if node.children:
-            self._compile_node(node.children[0])
+            child = node.children[0]
+            if child.node_type == NodeType.Expression:
+                self._compile_expr(child.expr)
+            else:
+                self._compile_node(child)
+                
             macros.pop(macros.t0) 
             self.current_stack_depth -= 4
             asm.addi(macros.a0, macros.t0, 0)
@@ -153,15 +162,32 @@ class Compiler:
     def Expression(self, node):
         if node.expr:
             self._compile_expr(node.expr)
+            # Prevent standalone statement expressions from leaking memory!
+            macros.pop(macros.t0)
+            self.current_stack_depth -= 4
 
     def FieldDecl(self, node):
-        for child in node.children:
+        child = node.children[0]
+        if child.node_type == NodeType.Expression:
+            self._compile_expr(child.expr)
+        else:
             self._compile_node(child)
         self.declare_symbol(node.identifier)
 
     def Block(self, node):
+        self.enter_scope()
+        start_depth = self.current_stack_depth
+        
         for child in node.children:
             self._compile_node(child)
+            
+        # Crucial scope cleanup! Protects loops.
+        diff = self.current_stack_depth - start_depth
+        if diff > 0:
+            asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
+            self.current_stack_depth = start_depth
+            
+        self.exit_scope()
 
     def Assignment(self, node):
         name = node.identifier
@@ -170,9 +196,11 @@ class Compiler:
             node.children[0].args:
             self._compile_function_def(name, node.children[0])
         else:
-            for child in node.children:
+            child = node.children[0]
+            if child.node_type == NodeType.Expression:
+                self._compile_expr(child.expr)
+            else:
                 self._compile_node(child)
-                    
             self.declare_symbol(name)
 
     def Store(self, node):
@@ -214,6 +242,11 @@ class Compiler:
         for child in block_node.children:
             self._compile_node(child)
             
+        asm.addi(macros.a0, macros.x0, 0)
+        if self.current_stack_depth > 0:
+            asm.addi(macros.stack_ptr, macros.stack_ptr, -self.current_stack_depth)
+        asm.jalr(macros.x0, macros.ra, 0)
+            
         self.exit_scope()
         self.current_stack_depth = old_depth
         asm.label(end_label)
@@ -253,21 +286,26 @@ class Compiler:
                     asm.sub(macros.t0, macros.t0, macros.t1)
                 elif op_sym == "==":
                     asm.sub(macros.t0, macros.t0, macros.t1)
-                    asm.sltiu(macros.t0, macros.t0, 1)     # Set T0 == 1 if T0 resulted in 0 difference
+                    asm.sltiu(macros.t0, macros.t0, 1)     
                 elif op_sym == "!=":
                     asm.sub(macros.t0, macros.t0, macros.t1)
-                    asm.sltu(macros.t0, macros.x0, macros.t0) # Set T0 == 1 if T0 > 0 (different values)
+                    asm.sltu(macros.t0, macros.x0, macros.t0) 
                 elif op_sym == "<":
                     asm.slt(macros.t0, macros.t0, macros.t1)
                 elif op_sym == ">":
                     asm.slt(macros.t0, macros.t1, macros.t0)
+                elif op_sym == "<=":
+                    asm.slt(macros.t0, macros.t1, macros.t0) 
+                    asm.xori(macros.t0, macros.t0, 1)        
+                elif op_sym == ">=":
+                    asm.slt(macros.t0, macros.t0, macros.t1) 
+                    asm.xori(macros.t0, macros.t0, 1)        
                 
                 macros.push(macros.t0)
                 self.current_stack_depth += 4
 
             case ExprNodeType.Call:
                 func_name = node.value.value
-                
                 asm.addi(macros.t0, macros.ra, 0)
                 macros.push(macros.t0)
                 self.current_stack_depth += 4
@@ -276,7 +314,6 @@ class Compiler:
                     self._compile_expr(arg)
                 
                 asm.jal(macros.ra, func_name)
-                
                 asm.addi(macros.t2, macros.a0, 0) 
 
                 for _ in node.children:
@@ -291,7 +328,6 @@ class Compiler:
 
             case ExprNodeType.ArrayAlloc:
                 size = node.value.value 
-
                 macros.push(macros.stack_ptr) 
                 self.current_stack_depth += 4
                 
