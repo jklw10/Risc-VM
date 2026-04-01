@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 import re
 
-splitchartype = re.compile(r"([*()\^/=\+\-!|&<>\[\]{}:;,])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
+# Safely split comparison ops BEFORE single character splits!
+splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
+
 def tokenize(text):
     text = re.sub(r'//.*', '', text)
     token_strings = splitchartype.split(text)
@@ -13,7 +15,6 @@ def tokenize(text):
             continue
         tokens_out.append(from_string(ts))
     return tokens_out
-
 
 @dataclass(frozen=True)
 class Token():
@@ -30,26 +31,35 @@ class Symbol(Token):
 @dataclass(frozen=True)
 class Identifier(Token): 
     value: str
-
 @dataclass(frozen=True)
 class Value(Token):
     value: int
 
+# Establish priority parsing hierarchy 
 weight_dict = {
+    Symbol("==")  : 0,
+    Symbol("!=")  : 0,
+    Symbol("<")   : 0,
+    Symbol(">")   : 0,
+    Symbol("<=")  : 0,
+    Symbol(">=")  : 0,
     Symbol("+")   : 1,
     Symbol("-")   : 1,
     Symbol("*")   : 2,
     Symbol("/")   : 2,
     Symbol("^")   : 3,
 }
+
 def weight(op: Symbol):
     return weight_dict.get(op, 0)
-#known symbols¨
+
 sym_dict = {
     ""  : Symbol("NoOp" ),
     "(" : Symbol("("    ),
     ")" : Symbol(")"    ),
     "[" : Symbol("["    ),
+    "==": Symbol("=="   ),
+    "!=": Symbol("!="   ),
     "=" : Symbol("="    ),
     "{" : Symbol("{"    ),
     "}" : Symbol("}"    ),
@@ -91,7 +101,6 @@ def from_string(text:str) -> Token:
         return token
     if token := key_dict.get(text):
         return token
-    
     if text.isdigit():
         return Value(int(text))
     return Identifier(text)
@@ -106,17 +115,17 @@ def apply_operator(lhs, op, rhs):
     lhs.operate(rhs)
 def operate(lhs, rhs, op):
     match op:
-        case Symbol("+"):  return lhs +  rhs    # noqa: E701
-        case Symbol("-"):  return lhs -  rhs    # noqa: E701
-        case Symbol("*"):  return lhs *  rhs    # noqa: E701
-        case Symbol("/"):  return lhs /  rhs    # noqa: E701
-        case Symbol("**"): return lhs ** rhs    # noqa: E701
-        case Symbol("<"):  return lhs <  rhs    # noqa: E701 
-        case Symbol("<="): return lhs <= rhs    # noqa: E701
-        case Symbol(">"):  return lhs >  rhs    # noqa: E701 
-        case Symbol(">="): return lhs >= rhs    # noqa: E701 
-        case Symbol("!="): return lhs != rhs    # noqa: E701 
-        case Symbol("|"):  return lhs |  rhs    # noqa: E701
-        case Symbol("&"):  return lhs &  rhs    # noqa: E701
-        case _: return None                     # noqa: E701
-    
+        case Symbol("+"):  return lhs +  rhs    
+        case Symbol("-"):  return lhs -  rhs    
+        case Symbol("*"):  return lhs *  rhs    
+        case Symbol("/"):  return lhs /  rhs    
+        case Symbol("**"): return lhs ** rhs    
+        case Symbol("<"):  return lhs <  rhs     
+        case Symbol("<="): return lhs <= rhs    
+        case Symbol(">"):  return lhs >  rhs     
+        case Symbol(">="): return lhs >= rhs     
+        case Symbol("!="): return lhs != rhs    
+        case Symbol("=="): return lhs == rhs    
+        case Symbol("|"):  return lhs |  rhs    
+        case Symbol("&"):  return lhs &  rhs    
+        case _: return None

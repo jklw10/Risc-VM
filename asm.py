@@ -3,8 +3,8 @@ import struct
 class RiscVAssembler:
     def __init__(self):
         self.code = bytearray()
-        self.labels = {}       # "name" -> byte address
-        self.fixups = {}       # "name" -> list of (address_to_patch, function_to_rebuild_instruction)
+        self.labels = {}
+        self.fixups = {}
         self.pc = 0
 
     def get_binary(self):
@@ -77,21 +77,37 @@ class RiscVAssembler:
 
     # --- Immediate Arithmetic ---
     def addi(self, rd, rs1, imm): 
-        """rd = rs1 + imm (signed 12-bit)"""
         self._i_type(0x13, rd, rs1, imm, 0x0)
         
     def xori(self, rd, rs1, imm): 
-        """rd = rs1 ^ imm (signed 12-bit)"""
         self._i_type(0x13, rd, rs1, imm, 0x4)
         
     def ori(self,  rd, rs1, imm): 
-        """rd = rs1 | imm (signed 12-bit)"""
         self._i_type(0x13, rd, rs1, imm, 0x6)
         
     def andi(self, rd, rs1, imm): 
-        """rd = rs1 & imm (signed 12-bit)"""
         self._i_type(0x13, rd, rs1, imm, 0x7)
+        
+    def sltiu(self, rd, rs1, imm):
+        """rd = (rs1 < imm) ? 1 : 0 (unsigned)"""
+        self._i_type(0x13, rd, rs1, imm, 0x3)
     
+    # --- Register Arithmetic ---
+    def add(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x0, 0x00)
+        
+    def sub(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x0, 0x20)
+        
+    def xor(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x4, 0x00)
+        
+    def or_(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x6, 0x00)
+        
+    def and_(self,rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x7, 0x00)
+
     def sltu(self, rd, rs1, rs2):
         """rd = (rs1 < rs2) ? 1 : 0 (unsigned)"""
         self._r_type(0x33, rd, rs1, rs2, 0x3, 0x00)
@@ -99,79 +115,42 @@ class RiscVAssembler:
     def slt(self, rd, rs1, rs2):
         """rd = (rs1 < rs2) ? 1 : 0 (signed)"""
         self._r_type(0x33, rd, rs1, rs2, 0x2, 0x00)
-        
-    # --- Register Arithmetic ---
-    def add(self, rd, rs1, rs2): 
-        """rd = rs1 + rs2"""
-        self._r_type(0x33, rd, rs1, rs2, 0x0, 0x00)
-        
-    def sub(self, rd, rs1, rs2): 
-        """rd = rs1 - rs2"""
-        self._r_type(0x33, rd, rs1, rs2, 0x0, 0x20)
-        
-    def xor(self, rd, rs1, rs2): 
-        """rd = rs1 ^ rs2"""
-        self._r_type(0x33, rd, rs1, rs2, 0x4, 0x00)
-        
-    def or_(self, rd, rs1, rs2): 
-        """rd = rs1 | rs2"""
-        self._r_type(0x33, rd, rs1, rs2, 0x6, 0x00)
-        
-    def and_(self,rd, rs1, rs2): 
-        """rd = rs1 & rs2"""
-        self._r_type(0x33, rd, rs1, rs2, 0x7, 0x00)
 
     # --- Memory Access ---
     def load(self, rd, rs1, offset): 
-        """Load Word: rd = memory[rs1 + offset]"""
         self._i_type(0x03, rd, rs1, offset, 0x2)
         
     def store(self, rs1, offset, rs2): 
-        """
-        Store Word: memory[rs1 + offset] = rs2.
-        """
         self._s_type(0x23, rs1, rs2, offset, 0x2) 
 
     # --- Branching ---
-    
     def jal(self, rd, label):
-        """Jump And Link: rd = pc + 4; pc += offset"""
         offset = self._resolve_or_record(label, 'J')
         inst = self._j_type(0x6F, rd, offset)
         self.code.extend(struct.pack("<I", inst))
 
     def jalr(self, rd, rs1, offset):
-        """Jump and Link Register: rd = pc + 4; pc = rs1 + offset"""
-        # I-Type instruction: opcode 0x67, funct3 0x0
         self._i_type(0x67, rd, rs1, offset, 0x0)
-
+        
     def bge(self, rs1, rs2, label):
-        """Branch if Greater or Equal (signed)"""
         offset = self._resolve_or_record(label, 'B')
         inst = self._b_type(0x63, rs1, rs2, offset, 0x5)
         self.code.extend(struct.pack("<I", inst))
 
     def beq(self, rs1, rs2, label):
-        """Branch if Equal: if (rs1 == rs2) pc += offset"""
         offset = self._resolve_or_record(label, 'B')
         inst = self._b_type(0x63, rs1, rs2, offset, 0x0)
         self.code.extend(struct.pack("<I", inst))
     
     def bne(self, rs1, rs2, label): 
-        """Branch if Not Equal: if (rs1 != rs2) pc += offset"""
         offset = self._resolve_or_record(label, 'B')
         inst = self._b_type(0x63, rs1, rs2, offset, 0x1)
         self.code.extend(struct.pack("<I", inst))
     
     def lui(self, rd, imm):
-        """
-        U-Type Instruction: imm[31:12] | rd | 0110111
-        The 'imm' passed here should be the raw 20-bit value (already shifted down).
-        """
         opcode = 0x37
         imm_val = (int(imm) & 0xFFFFF)
         inst = (imm_val << 12) | (rd << 7) | opcode
-        #self.add_instruction(inst)
         self.code.extend(struct.pack("<I", inst))
 
     def _encode_j_imm(self, offset):
@@ -180,7 +159,6 @@ class RiscVAssembler:
         bits_19_12 = (imm >> 12) & 0xFF
         bit_11 = (imm >> 11) & 1
         bits_10_1 = (imm >> 1) & 0x3FF
-        
         return (bit_20 << 31) | (bits_10_1 << 21) | (bit_11 << 20) | (bits_19_12 << 12)
 
     def _encode_b_imm(self, offset):
@@ -189,9 +167,7 @@ class RiscVAssembler:
         bit_11 = (imm >> 11) & 1
         bits_10_5 = (imm >> 5) & 0x3F
         bits_4_1 = (imm >> 1) & 0xF
-        
         return (bit_12 << 31) | (bits_10_5 << 25) | (bits_4_1 << 8) | (bit_11 << 7)
 
     def ecall(self): 
-        """Environment Call (System Call). Transfers control to OS."""
         self._emit(0x00000073)
