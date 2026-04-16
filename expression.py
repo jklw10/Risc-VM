@@ -12,6 +12,7 @@ class ExprNodeType(Enum):
     ArrayAlloc     = auto()    
     BlockLiteral   = auto()    
     Deref          = auto()
+    Macro          = auto() 
 
 @dataclass
 class ExprNode:
@@ -57,17 +58,31 @@ class ExpressionParser:
         if not self.output_queue:
             return None
         return self.output_queue[0]
-
+    def parse_Keyword(self, token: Keyword):
+        if token == Keyword("alloc"):
+            if self.i+1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("[") and self.tokens[self.i+2] == Symbol(":"):
+                size_tok = self.tokens[self.i+3]
+                node = ExprNode(ExprNodeType.ArrayAlloc, value=size_tok)
+                self.output_queue.append(node)
+                self.i += 5
+                
+                if self.i < len(self.tokens) and self.tokens[self.i] == Symbol("["):
+                    while self.i < len(self.tokens) and self.tokens[self.i] != Symbol("]"):
+                        self.i += 1
+                    self.i += 1
+            else:
+                raise SyntaxError("Invalid alloc syntax")
+        else:
+            self.parse_default(token)
     def parse_Value(self, token: Value):
         self.output_queue.append(ExprNode(ExprNodeType.Value, value=token))
 
     def parse_Identifier(self, token: Identifier):
-        # Look ahead for Function Call: ident(...)
         if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("("):
             func_name = token
-            self.i += 2 # Skip ident and (
-            args =[]
-            current_arg_tokens =[]
+            self.i += 2 
+            args = []
+            current_arg_tokens = []
             balance = 1
             
             while self.i < len(self.tokens):
@@ -81,7 +96,7 @@ class ExpressionParser:
                 elif cur_token == Symbol(",") and balance == 1:
                     if current_arg_tokens:
                         args.append(parse_expression(current_arg_tokens))
-                        current_arg_tokens =[]
+                        current_arg_tokens = []
                     self.i += 1
                     continue
                 
@@ -92,37 +107,61 @@ class ExpressionParser:
                 args.append(parse_expression(current_arg_tokens))
             
             self.output_queue.append(ExprNode(ExprNodeType.Call, value=func_name, children=args))
+            
+        elif self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("["):
+            # Array Read Syntax: ident[idx]
+            name = token
+            self.i += 2
+            idx_tokens = []
+            balance = 1
+            while self.i < len(self.tokens):
+                cur = self.tokens[self.i]
+                if cur == Symbol("["): balance += 1
+                elif cur == Symbol("]"):
+                    balance -= 1
+                    if balance == 0: break
+                idx_tokens.append(cur)
+                self.i += 1
+            
+            # Resolves dynamically to raw pointer arithmetic (No * 4 for byte mapping)
+            idx_expr = parse_expression(idx_tokens)
+            add_node = ExprNode(ExprNodeType.BinaryOp, value=Symbol("+"), left=ExprNode(ExprNodeType.Identifier, value=name), right=idx_expr)
+            deref_node = ExprNode(ExprNodeType.Deref, left=add_node)
+            
+            self.output_queue.append(deref_node)
         else:
             self.output_queue.append(ExprNode(ExprNodeType.Identifier, value=token))
-
     def parse_Symbol(self, token: Symbol):
         # Sub-dispatch specific symbols to clean methods
         symbol_map = {
             "[": self.Symbol_LBracket,
             "(": self.Symbol_LParen,
             ")": self.Symbol_RParen,
+            "@": self.Symbol_At,   
         }
         handler = symbol_map.get(token.value, self.Symbol_Operator)
         handler(token)
 
+    def Symbol_At(self, token: Symbol):
+        # Parses: @asm(addi t0, t0, t1)
+        self.i += 1
+        macro_name = self.tokens[self.i] # Expecting Identifier("asm")
+        self.i += 2 # Skip name and '('
+        
+        raw_tokens = []
+        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol(")"):
+            # Ignore commas for cleanliness
+            if self.tokens[self.i] != Symbol(","):
+                raw_tokens.append(self.tokens[self.i])
+            self.i += 1
+            
+        self.output_queue.append(ExprNode(ExprNodeType.Macro, value=macro_name, children=raw_tokens))
+        
     def Symbol_LBracket(self, token: Symbol):
-        # Handle Array Alloc [:10]
-        if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol(":"):
-            if self.i + 2 < len(self.tokens) and isinstance(self.tokens[self.i+2], Value):
-                size_token = self.tokens[self.i+2]
-                node = ExprNode(ExprNodeType.ArrayAlloc, value=size_token)
-                self.output_queue.append(node)
-                self.i += 3 # Skip[ : 10
-                
-                if self.i >= len(self.tokens) or self.tokens[self.i] != Symbol("]"):
-                    raise SyntaxError("Missing ] for array alloc")
-            else:
-                raise SyntaxError("Invalid array alloc syntax")
-        else:
-            # Handle Deref [ptr]
+        if self.i < len(self.tokens) and self.tokens[self.i] == Symbol(":"):
+            self.i += 1 # Skip ':'
             inner_tokens =[]
             bracket_balance = 1
-            self.i += 1 
             while self.i < len(self.tokens):
                 cur_token = self.tokens[self.i]
                 if cur_token == Symbol("["): 
@@ -130,17 +169,40 @@ class ExpressionParser:
                 elif cur_token == Symbol("]"): 
                     bracket_balance -= 1
                 
-                if bracket_balance == 0:
+                if bracket_balance == 0: 
                     break
                 inner_tokens.append(cur_token)
                 self.i += 1
-            
+                
             if not inner_tokens:
-                raise SyntaxError("Empty[] dereference")
+                raise SyntaxError("Empty space slice [: ]")
                 
             inner_expr = parse_expression(inner_tokens)
-            node = ExprNode(ExprNodeType.Deref, left=inner_expr)
+            node = ExprNode(ExprNodeType.ArrayAlloc, left=inner_expr)
             self.output_queue.append(node)
+            return
+        # Handle Raw Deref [ptr]
+        inner_tokens = []
+        bracket_balance = 1
+        self.i += 1 
+        while self.i < len(self.tokens):
+            cur_token = self.tokens[self.i]
+            if cur_token == Symbol("["): 
+                bracket_balance += 1
+            elif cur_token == Symbol("]"): 
+                bracket_balance -= 1
+            
+            if bracket_balance == 0:
+                break
+            inner_tokens.append(cur_token)
+            self.i += 1
+        
+        if not inner_tokens:
+            raise SyntaxError("Empty [] dereference")
+            
+        inner_expr = parse_expression(inner_tokens)
+        node = ExprNode(ExprNodeType.Deref, left=inner_expr)
+        self.output_queue.append(node)
 
     def Symbol_LParen(self, token: Symbol):
         self.operator_stack.append(token)

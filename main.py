@@ -2,6 +2,7 @@ import ctypes
 import os
 import glob
 
+import traceback
 import macros
 import AST
 import compiler
@@ -59,6 +60,7 @@ def run_program(lib, RiscVState, filepath):
         program_bytes = compile_file(filepath)
     except Exception as e:
         print(f"Compilation failed for {filepath}: {e}")
+        traceback.print_exc()
         return
     
     # 1. Output the raw binary for external tools (e.g. objdump)

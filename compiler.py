@@ -4,6 +4,8 @@ from AST import NodeType, ASTNode
 from expression import ExprNodeType, ExprNode
 from typing import Dict, Optional, List
 from dataclasses import dataclass
+from tokens import Symbol
+from tokens import Identifier, Value
 
 @dataclass
 class SymbolInfo:
@@ -20,6 +22,7 @@ class SymbolInfo:
 class Compiler:
     def __init__(self):
         self.scopes: List[Dict[str, SymbolInfo]] = [{}]
+        self.types = {} # <-- Store comptime types here!
         self.current_stack_depth = 0
         self.label_counter = 0
 
@@ -62,11 +65,12 @@ class Compiler:
         label_name = node.identifier
         var_name = node.args[0]
         
-        self._compile_expr(node.children[0].expr)
-        count_offset = self.current_stack_depth - 4 
+        # node.children[1] = End limit expression
+        self._compile_expr(node.children[1].expr)
+        end_offset = self.current_stack_depth - 4
         
-        macros.push_value(0)
-        self.current_stack_depth += 4
+        # node.children[0] = Start limit expression (This becomes our iterator var)
+        self._compile_expr(node.children[0].expr)
         
         self.enter_scope()
         var_info = self.declare_symbol(var_name)
@@ -90,10 +94,10 @@ class Compiler:
         
         asm.label(l_start)
         asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
-        asm.load(macros.t1, macros.stack_ptr, count_offset - self.current_stack_depth)
+        asm.load(macros.t1, macros.stack_ptr, end_offset - self.current_stack_depth)
         asm.bge(macros.t0, macros.t1, l_end)
         
-        self._compile_node(node.children[1])
+        self._compile_node(node.children[2])
         
         asm.label(l_next)
         asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
@@ -104,8 +108,8 @@ class Compiler:
         asm.label(l_end)
         self.exit_scope()
         
-        macros.pop(macros.t0)
-        macros.pop(macros.t0)
+        macros.pop(macros.t0) # Pop iteration start var out of stack
+        macros.pop(macros.t0) # Pop end var out of stack
         self.current_stack_depth -= 8
 
     def LoopControl(self, node):
@@ -191,17 +195,46 @@ class Compiler:
 
     def Assignment(self, node):
         name = node.identifier
-        if node.children and \
-            node.children[0].node_type == NodeType.Block and \
-            node.children[0].args:
-            self._compile_function_def(name, node.children[0])
+        if node.children and node.children[0].node_type == NodeType.Block and node.children[0].args:
+            block_node = node.children[0]
+            
+            # 1:A - Is this a Comptime Type Definition?
+            if getattr(block_node, "is_type", False):
+                # Find the space slice constraint: e.g. `[:4]`
+                for constraint in block_node.arg_constraints:
+                    if constraint and constraint[0] == Symbol(":"):
+                        # Evaluate the comptime size requested!
+                        expr_toks = constraint[1:]
+                        import expression # ensure imported
+                        size_expr = expression.parse_expression(expr_toks)
+                        comptime_size = self._evaluate_comptime(size_expr)
+                        
+                        # Register the base type layout
+                        self.types[name] = {
+                            "size": comptime_size,
+                            "methods": {} 
+                        }
+                        print(f"[Comptime] Registered Type: {name} (Size: {comptime_size} bytes)")
+                        
+                        # (In the next iteration, we'll scan block_node.children 
+                        #  for property assignments like `value.add = ...` to fill "methods")
+                        return 
+            
+            # Otherwise, compile it as a normal runtime pipeline function
+            self._compile_function_def(name, block_node)
         else:
-            child = node.children[0]
-            if child.node_type == NodeType.Expression:
-                self._compile_expr(child.expr)
+            name = node.identifier
+            if node.children and \
+                node.children[0].node_type == NodeType.Block and \
+                node.children[0].args:
+                self._compile_function_def(name, node.children[0])
             else:
-                self._compile_node(child)
-            self.declare_symbol(name)
+                child = node.children[0]
+                if child.node_type == NodeType.Expression:
+                    self._compile_expr(child.expr)
+                else:
+                    self._compile_node(child)
+                self.declare_symbol(name)
 
     def Store(self, node):
         self._compile_expr(node.children[1].expr)
@@ -250,9 +283,52 @@ class Compiler:
         self.exit_scope()
         self.current_stack_depth = old_depth
         asm.label(end_label)
-
+    def _evaluate_comptime(self, node: ExprNode) -> int:
+        """Evaluates an AST math expression during compilation."""
+        if node.type == ExprNodeType.Value:
+            return node.value.value
+        elif node.type == ExprNodeType.BinaryOp:
+            left = self._evaluate_comptime(node.left)
+            right = self._evaluate_comptime(node.right)
+            op = node.value.value
+            if op == "+": 
+                return left + right
+            if op == "-": 
+                return left - right
+            if op == "*": 
+                return left * right
+            if op == "/": 
+                return left // right
+        raise ValueError(f"Space slice [:expr] must be a compile-time constant. Got: {node.type}")
     def _compile_expr(self, node: ExprNode):
         match node.type:
+            case ExprNodeType.Macro:
+                if node.value.value != "asm":
+                    raise SyntaxError(f"Unknown macro @{node.value.value}")
+                
+                # First token is the instruction (e.g., Identifier('addi'))
+                inst_name = node.children[0].value
+                args =[]
+                
+                # Map standard ABI names to your exact macros/asm register numbers
+                reg_map = {
+                    "x0":0, "ra":1, "sp":2, 
+                    "t0":5, "t1":6, "t2":7, "t3":8, 
+                    "a0":10
+                }
+                
+                for child in node.children[1:]:
+                    if isinstance(child, Identifier):
+                        if child.value in reg_map:
+                            args.append(reg_map[child.value])
+                        else:
+                            raise ValueError(f"Unknown register in @asm: {child.value}")
+                    elif isinstance(child, Value):
+                        args.append(child.value)
+                
+                # Dynamically call the method on your existing asm.py!
+                asm_method = getattr(asm, inst_name)
+                asm_method(*args)
             case ExprNodeType.Value:
                 macros.push_value(node.value.value)
                 self.current_stack_depth += 4
@@ -300,6 +376,8 @@ class Compiler:
                 elif op_sym == ">=":
                     asm.slt(macros.t0, macros.t0, macros.t1) 
                     asm.xori(macros.t0, macros.t0, 1)        
+                else:
+                    raise SyntaxError(f"operand definition for {op_sym} was not found")
                 
                 macros.push(macros.t0)
                 self.current_stack_depth += 4
@@ -327,9 +405,10 @@ class Compiler:
                 self.current_stack_depth += 4
 
             case ExprNodeType.ArrayAlloc:
-                size = node.value.value 
+                size = self._evaluate_comptime(node.left) 
                 macros.push(macros.stack_ptr) 
                 self.current_stack_depth += 4
                 
-                asm.addi(macros.stack_ptr, macros.stack_ptr, size * 4)
-                self.current_stack_depth += (size * 4)
+                # Raw bytes allocation instead of size * 4
+                asm.addi(macros.stack_ptr, macros.stack_ptr, size)
+                self.current_stack_depth += size

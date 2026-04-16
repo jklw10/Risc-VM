@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import re
 
-# Safely split comparison ops BEFORE single character splits!
 splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
 
 def tokenize(text):
@@ -35,7 +34,6 @@ class Identifier(Token):
 class Value(Token):
     value: int
 
-# Establish priority parsing hierarchy 
 weight_dict = {
     Symbol("==")  : 0,
     Symbol("!=")  : 0,
@@ -48,6 +46,7 @@ weight_dict = {
     Symbol("*")   : 2,
     Symbol("/")   : 2,
     Symbol("^")   : 3,
+    Symbol(".")   : 5,
 }
 
 def weight(op: Symbol):
@@ -81,17 +80,19 @@ sym_dict = {
     "," : Symbol(","    ),
     ":" : Symbol(":"    ),
     ";" : Symbol(";"    ),
+    "@" : Symbol("@"    ),
 }
 
 key_dict = {
-    "struct"    : Keyword("struct"),
-    "return"    : Keyword("return"),
+    "alloc"     : Keyword("alloc" ),
     "const"     : Keyword("const" ),
-    "break"     : Keyword("break" ),
-    "skip"      : Keyword("skip"  ),
     "null"      : Keyword("null"  ),
     "var"       : Keyword("var"   ),
-    "fn"        : Keyword("fn"    ),
+    #"return"    : Keyword("return"),
+    #"break"     : Keyword("break" ),
+    #"type"      : Keyword("type"  ),
+    #"skip"      : Keyword("skip"  ),
+    #"fn"        : Keyword("fn"    ),
 }
 
 def from_string(text:str) -> Token:
