@@ -154,7 +154,7 @@ class ExpressionParser:
         handler(token)
 
     def Symbol_At(self, token: Symbol):
-        # Parses: @asm(addi t0, t0, t1)
+        # Parses: @asm(...), @embed(...), @import(...)
         self.i += 1
         macro_name = self.tokens[self.i] # Expecting Identifier("asm")
         self.i += 2 # Skip name and '('
@@ -169,8 +169,8 @@ class ExpressionParser:
         self.output_queue.append(ExprNode(ExprNodeType.Macro, value=macro_name, children=raw_tokens))
 
     def Symbol_LBracket(self, token: Symbol):
-        if self.i < len(self.tokens) and self.tokens[self.i] == Symbol(":"):
-            self.i += 1 # Skip ':'
+        if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol(":"):
+            self.i += 2 # Skip '[' and ':'
             inner_tokens =[]
             bracket_balance = 1
             while self.i < len(self.tokens):

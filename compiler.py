@@ -6,7 +6,9 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass
 from tokens import Symbol
 from tokens import Identifier, Value
-
+import tokens
+import AST
+import expression
 @dataclass
 class SymbolInfo:
     offset_from_base: int  
@@ -193,9 +195,68 @@ class Compiler:
             self.current_stack_depth = start_depth
             
         self.exit_scope()
+    
+    def _handle_import(self, namespace: str, filepath: str):
+        """Loads a .w file, namespaces its AST declarations, and compiles it in-place."""
+        
+        with open(filepath, 'r') as f:
+            source = f.read()
+            
+        imported_tokens = tokens.tokenize(source)
+        imported_ast = AST.parse(imported_tokens)
+        
+        # 1. Gather top-level elements
+        top_level_names = set()
+        for node in imported_ast.children:
+            if getattr(node, 'identifier', None):
+                top_level_names.add(node.identifier)
+                
+        # 2. Namespace renamer visitor
+        def replace_names(node):
+            if isinstance(node, AST.ASTNode):
+                if getattr(node, 'identifier', None) in top_level_names:
+                    node.identifier = f"{namespace}.{node.identifier}"
+                    
+                if hasattr(node, 'arg_constraints'):
+                    for constraint_toks in node.arg_constraints:
+                        for i, tok in enumerate(constraint_toks):
+                            if isinstance(tok, tokens.Identifier) and tok.value in top_level_names:
+                                constraint_toks[i] = tokens.Identifier(f"{namespace}.{tok.value}")
+                                
+                for child in node.children:
+                    replace_names(child)
+                if node.expr:
+                    replace_names(node.expr)
+                    
+            elif isinstance(node, expression.ExprNode):
+                if node.type in (expression.ExprNodeType.Identifier, expression.ExprNodeType.Call):
+                    if isinstance(node.value, tokens.Identifier) and node.value.value in top_level_names:
+                        node.value = tokens.Identifier(f"{namespace}.{node.value.value}")
+                elif node.type == expression.ExprNodeType.Macro:
+                    for i, child in enumerate(node.children):
+                        if isinstance(child, tokens.Identifier) and child.value in top_level_names:
+                            node.children[i] = tokens.Identifier(f"{namespace}.{child.value}")
+                            
+                for child in node.children:
+                    if isinstance(child, (AST.ASTNode, expression.ExprNode)):
+                        replace_names(child)
+                if node.left: replace_names(node.left)
+                if node.right: replace_names(node.right)
 
+        replace_names(imported_ast)
+        
+        # 3. Compile the namespace'd AST natively into our context
+        for child in imported_ast.children:
+            self._compile_node(child)
     def Assignment(self, node):
         name = node.identifier
+        if node.children and node.children[0].node_type == NodeType.Expression:
+            expr_node = node.children[0].expr
+            if expr_node and expr_node.type == ExprNodeType.Macro and expr_node.value.value == "import":
+                # Stringify the path out of the raw token identifiers/symbols
+                path = "".join(str(t.value) for t in expr_node.children)
+                self._handle_import(name, path)
+                return
         if node.children and node.children[0].node_type == NodeType.Block and node.children[0].args:
             block_node = node.children[0]
             
@@ -302,79 +363,99 @@ class Compiler:
     def _compile_expr(self, node: ExprNode):
         match node.type:
             case ExprNodeType.Macro:
-                if node.value.value != "asm":
-                    raise SyntaxError(f"Unknown macro @{node.value.value}")
+                macro_name = node.value.value
                 
-                inst_name = node.children[0].value
-                args =[]
-                
-                # Full standard RISC-V ABI to integer registers
-                reg_map = macros.reg_map
-                
-                # Instructions that do NOT have a destination register (rd) as their first argument
-                no_rd_instructions = {"store", "bge", "beq", "bne", "ecall"}
-                has_rd = inst_name not in no_rd_instructions
-                
-                # Pool of registers for loading variables (t1, t2, a1, a2, a3, a4)
-                temp_pool =[6, 7, 11, 12, 13, 14]
-                temp_idx = 0
-                
-                store_back_sym = None
-                rd_reg_to_push = 0
-                
-                for i, child in enumerate(node.children[1:]):
-                    if isinstance(child, Identifier):
-                        name = child.value
-                        if name in reg_map:
-                            args.append(reg_map[name])
-                            if i == 0 and has_rd:
-                                rd_reg_to_push = reg_map[name]
-                        else:
-                            # It's a local variable!
-                            sym = self.get_symbol(name)
-                            is_output = (i == 0 and has_rd)
-                            
-                            if is_output:
-                                if not sym:
-                                    # Auto-declare the variable in memory!
-                                    macros.push(macros.x0)
-                                    self.current_stack_depth += 4
-                                    sym = self.declare_symbol(name)
-                                
-                                # Use t0 (register 5) as the physical rd
-                                args.append(5)
-                                store_back_sym = sym
-                                rd_reg_to_push = 5
-                            else:
-                                if not sym:
-                                    raise ValueError(f"Undefined variable read in @asm: {name}")
-                                
-                                if temp_idx >= len(temp_pool):
-                                    raise ValueError("Too many memory variables in @asm block.")
-                                tmp_reg = temp_pool[temp_idx]
-                                temp_idx += 1
-                                
-                                # Load the variable from stack into the temp register
-                                offset = sym.offset_from_base - self.current_stack_depth
-                                asm.load(tmp_reg, macros.stack_ptr, offset)
-                                args.append(tmp_reg)
-                                
-                    elif isinstance(child, Value):
-                        args.append(child.value)
+                if macro_name == "embed":
+                    # Spite string literals. Build string backwards from the tokens!
+                    path = "".join(str(t.value) for t in node.children)
+                    with open(path, "rb") as f:
+                        data = f.read()
                         
-                # Call the raw instruction builder
-                asm_method = getattr(asm, inst_name)
-                asm_method(*args)
-                
-                # If we targeted a memory variable, store the result back into memory!
-                if store_back_sym:
-                    offset = store_back_sym.offset_from_base - self.current_stack_depth
-                    asm.store(macros.stack_ptr, offset, macros.t0) # 5 is t0
-                
-                # Push the evaluated result to the stack so it remains a valid Expression
-                macros.push(rd_reg_to_push)
-                self.current_stack_depth += 4
-                return None
+                    skip_label = self.get_unique_label("skip_embed")
+                    # jal rd, offset assigns the address of the NEXT instruction to rd
+                    # which happens to be exactly where our raw bytes start! 
+                    asm.jal(macros.t0, skip_label)
+                    
+                    # Dump bytes straight into the code segment
+                    asm.code.extend(data)
+                    
+                    # Instruction Alignment constraint padding (ensure future instructions don't misalign)
+                    padding = (4 - (len(data) % 4)) % 4
+                    if padding > 0:
+                        asm.code.extend(b'\x00' * padding)
+                        
+                    asm.label(skip_label)
+                    
+                    macros.push(macros.t0)
+                    self.current_stack_depth += 4
+                    return None
+                    
+                elif macro_name == "import":
+                    raise SyntaxError("@import can only be used as a namespace assignment (e.g. math = @import(math.w))")
+                    
+                elif macro_name == "asm":
+                    inst_name = node.children[0].value
+                    args =[]
+                    
+                    reg_map = macros.reg_map
+                    no_rd_instructions = {"store", "bge", "beq", "bne", "ecall"}
+                    has_rd = inst_name not in no_rd_instructions
+                    
+                    temp_pool =[6, 7, 11, 12, 13, 14]
+                    temp_idx = 0
+                    
+                    store_back_sym = None
+                    rd_reg_to_push = 0
+                    
+                    for i, child in enumerate(node.children[1:]):
+                        if isinstance(child, Identifier):
+                            name = child.value
+                            if name in reg_map:
+                                args.append(reg_map[name])
+                                if i == 0 and has_rd:
+                                    rd_reg_to_push = reg_map[name]
+                            else:
+                                sym = self.get_symbol(name)
+                                is_output = (i == 0 and has_rd)
+                                
+                                if is_output:
+                                    if not sym:
+                                        macros.push(macros.x0)
+                                        self.current_stack_depth += 4
+                                        sym = self.declare_symbol(name)
+                                    
+                                    args.append(5)
+                                    store_back_sym = sym
+                                    rd_reg_to_push = 5
+                                else:
+                                    if not sym:
+                                        raise ValueError(f"Undefined variable read in @asm: {name}")
+                                    
+                                    if temp_idx >= len(temp_pool):
+                                        raise ValueError("Too many memory variables in @asm block.")
+                                    tmp_reg = temp_pool[temp_idx]
+                                    temp_idx += 1
+                                    
+                                    offset = sym.offset_from_base - self.current_stack_depth
+                                    asm.load(tmp_reg, macros.stack_ptr, offset)
+                                    args.append(tmp_reg)
+                                    
+                        elif isinstance(child, Value):
+                            args.append(child.value)
+                            
+                    asm_method = getattr(asm, inst_name)
+                    asm_method(*args)
+                    
+                    if store_back_sym:
+                        offset = store_back_sym.offset_from_base - self.current_stack_depth
+                        asm.store(macros.stack_ptr, offset, macros.t0) 
+                    
+                    macros.push(rd_reg_to_push)
+                    self.current_stack_depth += 4
+                    return None
+                    
+                else:
+                    raise SyntaxError(f"Unknown macro @{macro_name}")
 
             case ExprNodeType.Value:
                 macros.push_value(node.value.value)
