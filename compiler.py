@@ -18,6 +18,7 @@ class SymbolInfo:
     l_next: str = ""
     l_end: str = ""
     var_offset: int = 0
+    type_name: str = "" 
 
 class Compiler:
     def __init__(self):
@@ -32,9 +33,9 @@ class Compiler:
                 return scope[name]
         return None
 
-    def declare_symbol(self, name: str, is_fn=False, args=0):
+    def declare_symbol(self, name: str, is_fn=False, args=0, type_name=""):
         info = SymbolInfo(offset_from_base=self.current_stack_depth-4,
-                           is_function=is_fn, arg_count=args)
+                           is_function=is_fn, arg_count=args, type_name=type_name)
         self.scopes[-1][name] = info
         return info
 
@@ -198,43 +199,40 @@ class Compiler:
         if node.children and node.children[0].node_type == NodeType.Block and node.children[0].args:
             block_node = node.children[0]
             
-            # 1:A - Is this a Comptime Type Definition?
             if getattr(block_node, "is_type", False):
-                # Find the space slice constraint: e.g. `[:4]`
+                comptime_size = 0
                 for constraint in block_node.arg_constraints:
                     if constraint and constraint[0] == Symbol(":"):
-                        # Evaluate the comptime size requested!
                         expr_toks = constraint[1:]
-                        import expression # ensure imported
+                        import expression 
                         size_expr = expression.parse_expression(expr_toks)
                         comptime_size = self._evaluate_comptime(size_expr)
+                        break
                         
-                        # Register the base type layout
-                        self.types[name] = {
-                            "size": comptime_size,
-                            "methods": {} 
-                        }
-                        print(f"[Comptime] Registered Type: {name} (Size: {comptime_size} bytes)")
-                        
-                        # (In the next iteration, we'll scan block_node.children 
-                        #  for property assignments like `value.add = ...` to fill "methods")
-                        return 
-            
-            # Otherwise, compile it as a normal runtime pipeline function
+                self.types[name] = {"size": comptime_size, "methods": {}}
+                print(f"[Comptime] Registered Type: {name} (Size: {comptime_size} bytes)")
+                
+                # Scan the block for methods like `value.add = (self, other) : { ... }`
+                for child in block_node.children:
+                    if child.node_type == NodeType.Assignment and "." in child.identifier:
+                        base, method_name = child.identifier.split(".", 1)
+                        if child.children and child.children[0].node_type == NodeType.Block:
+                            # Compile the method globally as a standard function!
+                            global_func_name = f"__{name}_{method_name}"
+                            self.types[name]["methods"][method_name] = global_func_name
+                            self._compile_function_def(global_func_name, child.children[0])
+                return 
+                
             self._compile_function_def(name, block_node)
         else:
-            name = node.identifier
-            if node.children and \
-                node.children[0].node_type == NodeType.Block and \
-                node.children[0].args:
-                self._compile_function_def(name, node.children[0])
+            child = node.children[0]
+            assigned_type = ""
+            if child.node_type == NodeType.Expression:
+                assigned_type = self._compile_expr(child.expr) or "" # Catch the type returned!
             else:
-                child = node.children[0]
-                if child.node_type == NodeType.Expression:
-                    self._compile_expr(child.expr)
-                else:
-                    self._compile_node(child)
-                self.declare_symbol(name)
+                self._compile_node(child)
+                
+            self.declare_symbol(name, type_name=assigned_type)
 
     def Store(self, node):
         self._compile_expr(node.children[1].expr)
@@ -300,35 +298,84 @@ class Compiler:
             if op == "/": 
                 return left // right
         raise ValueError(f"Space slice [:expr] must be a compile-time constant. Got: {node.type}")
+    
     def _compile_expr(self, node: ExprNode):
         match node.type:
             case ExprNodeType.Macro:
                 if node.value.value != "asm":
                     raise SyntaxError(f"Unknown macro @{node.value.value}")
                 
-                # First token is the instruction (e.g., Identifier('addi'))
                 inst_name = node.children[0].value
                 args =[]
                 
-                # Map standard ABI names to your exact macros/asm register numbers
-                reg_map = {
-                    "x0":0, "ra":1, "sp":2, 
-                    "t0":5, "t1":6, "t2":7, "t3":8, 
-                    "a0":10
-                }
+                # Full standard RISC-V ABI to integer registers
+                reg_map = macros.reg_map
                 
-                for child in node.children[1:]:
+                # Instructions that do NOT have a destination register (rd) as their first argument
+                no_rd_instructions = {"store", "bge", "beq", "bne", "ecall"}
+                has_rd = inst_name not in no_rd_instructions
+                
+                # Pool of registers for loading variables (t1, t2, a1, a2, a3, a4)
+                temp_pool =[6, 7, 11, 12, 13, 14]
+                temp_idx = 0
+                
+                store_back_sym = None
+                rd_reg_to_push = 0
+                
+                for i, child in enumerate(node.children[1:]):
                     if isinstance(child, Identifier):
-                        if child.value in reg_map:
-                            args.append(reg_map[child.value])
+                        name = child.value
+                        if name in reg_map:
+                            args.append(reg_map[name])
+                            if i == 0 and has_rd:
+                                rd_reg_to_push = reg_map[name]
                         else:
-                            raise ValueError(f"Unknown register in @asm: {child.value}")
+                            # It's a local variable!
+                            sym = self.get_symbol(name)
+                            is_output = (i == 0 and has_rd)
+                            
+                            if is_output:
+                                if not sym:
+                                    # Auto-declare the variable in memory!
+                                    macros.push(macros.x0)
+                                    self.current_stack_depth += 4
+                                    sym = self.declare_symbol(name)
+                                
+                                # Use t0 (register 5) as the physical rd
+                                args.append(5)
+                                store_back_sym = sym
+                                rd_reg_to_push = 5
+                            else:
+                                if not sym:
+                                    raise ValueError(f"Undefined variable read in @asm: {name}")
+                                
+                                if temp_idx >= len(temp_pool):
+                                    raise ValueError("Too many memory variables in @asm block.")
+                                tmp_reg = temp_pool[temp_idx]
+                                temp_idx += 1
+                                
+                                # Load the variable from stack into the temp register
+                                offset = sym.offset_from_base - self.current_stack_depth
+                                asm.load(tmp_reg, macros.stack_ptr, offset)
+                                args.append(tmp_reg)
+                                
                     elif isinstance(child, Value):
                         args.append(child.value)
-                
-                # Dynamically call the method on your existing asm.py!
+                        
+                # Call the raw instruction builder
                 asm_method = getattr(asm, inst_name)
                 asm_method(*args)
+                
+                # If we targeted a memory variable, store the result back into memory!
+                if store_back_sym:
+                    offset = store_back_sym.offset_from_base - self.current_stack_depth
+                    asm.store(macros.stack_ptr, offset, macros.t0) # 5 is t0
+                
+                # Push the evaluated result to the stack so it remains a valid Expression
+                macros.push(rd_reg_to_push)
+                self.current_stack_depth += 4
+                return None
+
             case ExprNodeType.Value:
                 macros.push_value(node.value.value)
                 self.current_stack_depth += 4
@@ -339,13 +386,14 @@ class Compiler:
                 macros.push(macros.t1)
             case ExprNodeType.Identifier:
                 sym = self.get_symbol(node.value.value)
-                if not sym:
+                if not sym: 
                     raise ValueError(f"Undefined variable: {node.value.value}")
                 
                 offset = (sym.offset_from_base - self.current_stack_depth) 
                 asm.load(macros.t0, macros.stack_ptr, offset) 
                 macros.push(macros.t0)
                 self.current_stack_depth += 4
+                return sym.type_name
 
             case ExprNodeType.BinaryOp:
                 self._compile_expr(node.left)
@@ -384,6 +432,53 @@ class Compiler:
 
             case ExprNodeType.Call:
                 func_name = node.value.value
+                
+                # 1. Is it an Object Spawn? (Type Instantiation)
+                if func_name in self.types:
+                    if not node.children: raise ValueError(f"Instantiation {func_name} requires an allocation argument.")
+                    self._compile_expr(node.children[0]) # Evaluates the memory slice, leaving pointer on stack
+                    return func_name # Returns the type name to the Assigner!
+                    
+                # 2. Is it a Method Call?
+                if "." in func_name:
+                    base_var, method = func_name.split(".", 1)
+                    sym = self.get_symbol(base_var)
+                    if not sym or not sym.type_name:
+                        raise ValueError(f"Cannot resolve method {func_name}. Variable '{base_var}' has no known type.")
+                        
+                    type_info = self.types.get(sym.type_name)
+                    if not type_info or method not in type_info["methods"]:
+                        raise ValueError(f"Type '{sym.type_name}' has no method '{method}'")
+                        
+                    real_func_name = type_info["methods"][method]
+                    
+                    asm.addi(macros.t0, macros.ra, 0)
+                    macros.push(macros.t0)
+                    self.current_stack_depth += 4
+                    
+                    # Push `self` as the implicit first argument!
+                    offset = (sym.offset_from_base - self.current_stack_depth)
+                    asm.load(macros.t0, macros.stack_ptr, offset)
+                    macros.push(macros.t0)
+                    self.current_stack_depth += 4
+                    
+                    for arg in node.children:
+                        self._compile_expr(arg)
+                        
+                    asm.jal(macros.ra, real_func_name)
+                    asm.addi(macros.t2, macros.a0, 0) 
+                    
+                    # Pop arguments PLUS the implicit `self`
+                    for _ in range(len(node.children) + 1):
+                         macros.pop(macros.x0) 
+                         self.current_stack_depth -= 4
+                    
+                    macros.pop(macros.ra)
+                    self.current_stack_depth -= 4
+                    
+                    macros.push(macros.t2)
+                    self.current_stack_depth += 4
+                    return None
                 asm.addi(macros.t0, macros.ra, 0)
                 macros.push(macros.t0)
                 self.current_stack_depth += 4

@@ -57,6 +57,13 @@ class ASTParser:
     
     def parse_Identifier(self, token: Identifier):
         name = token.value
+        start_i = self.i  
+        while self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("."):
+            if self.i + 2 < len(self.tokens) and isinstance(self.tokens[self.i+2], Identifier):
+                name += "." + self.tokens[self.i+2].value
+                self.i += 2
+            else:
+                break
         if self.i + 1 < len(self.tokens):
             next_tok = self.tokens[self.i+1]
             if next_tok == Symbol("="):
@@ -77,7 +84,8 @@ class ASTParser:
                 if j + 1 < len(self.tokens) and self.tokens[j+1] == Symbol("="):
                     self.parse_array_store(name, j)
                     return
-                
+        
+        self.i = start_i  
         self.parse_default(token)
 
     def parse_Symbol(self, token: Symbol):

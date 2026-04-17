@@ -78,6 +78,16 @@ class ExpressionParser:
         self.output_queue.append(ExprNode(ExprNodeType.Value, value=token))
 
     def parse_Identifier(self, token: Identifier):
+        name = token.value
+        
+        # Combine dot notations
+        while self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("."):
+            if self.i + 2 < len(self.tokens) and isinstance(self.tokens[self.i+2], Identifier):
+                name += "." + self.tokens[self.i+2].value
+                self.i += 2
+            else:
+                break
+        token = Identifier(name)
         if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("("):
             func_name = token
             self.i += 2 
@@ -131,6 +141,7 @@ class ExpressionParser:
             self.output_queue.append(deref_node)
         else:
             self.output_queue.append(ExprNode(ExprNodeType.Identifier, value=token))
+    
     def parse_Symbol(self, token: Symbol):
         # Sub-dispatch specific symbols to clean methods
         symbol_map = {
@@ -156,7 +167,7 @@ class ExpressionParser:
             self.i += 1
             
         self.output_queue.append(ExprNode(ExprNodeType.Macro, value=macro_name, children=raw_tokens))
-        
+
     def Symbol_LBracket(self, token: Symbol):
         if self.i < len(self.tokens) and self.tokens[self.i] == Symbol(":"):
             self.i += 1 # Skip ':'

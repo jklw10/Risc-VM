@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import re
 
-splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
+splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,.@?])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
 
 def tokenize(text):
     text = re.sub(r'//.*', '', text)
@@ -10,7 +10,8 @@ def tokenize(text):
     for ts in token_strings:
         if ts is None:
             continue
-        if ts.strip() == "":
+        ts = ts.strip()
+        if ts == "":
             continue
         tokens_out.append(from_string(ts))
     return tokens_out
