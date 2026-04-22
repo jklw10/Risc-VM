@@ -264,8 +264,50 @@ fn step(cpu: *CpuState) void {
 
         // --- 8. SYSTEM (ECALL) ---
         0x73 => {
-            // In a game, we can use this to end a level or print debug
-            cpu.halted = true;
+            const syscall_id = cpu.regs[17]; // a7
+            const a0 = cpu.regs[10];
+            const a1 = cpu.regs[11];
+            const a2 = cpu.regs[12];
+
+            switch (syscall_id) {
+                // Syscall 0: HALT / EXIT
+                0 => { 
+                    cpu.halted = true; 
+                },
+
+                // Syscall 1: PRINT_INT (print the integer in a0)
+                1 => {
+                    std.debug.print("{d}\n", .{a0});
+                },
+
+                // Syscall 2: WRITE (write `a2` bytes from VM memory at address `a1` to stdout)
+                2 => {
+                    // Safety check to ensure VM doesn't read out of bounds
+                    if (a1 + a2 <= cpu.memory.len) {
+                        const stdout = std.fs.File.stdout().writer();
+                        const slice = cpu.memory[a1 .. a1 + a2];
+                        stdout.writeAll(slice) catch |err| {
+                            std.debug.print("VM IO Error: {}\n", .{err});
+                        };
+                    }
+                },
+
+                // Syscall 3: OPEN FILE / READ FILE
+                3 => {
+                    // Safety check to ensure VM doesn't read out of bounds
+                    if (a1 + a2 <= cpu.memory.len) {
+                        const stdout = std.fs.File.stdin.writer();
+                        const slice = cpu.memory[a1 .. a1 + a2];
+                        stdin.readAll(slice) catch |err| {
+                            std.debug.print("VM IO Error: {}\n", .{err});
+                        };
+                    }
+                },
+                else => {
+                    std.debug.print("Unhandled ecall: {d}\n", .{syscall_id});
+                    cpu.halted = true;
+                }
+            }
         },
 
         // --- 9. UPPER IMMEDIATES ---

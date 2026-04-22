@@ -8,12 +8,13 @@ from expression import ExprNode
 class NodeType(Enum):
     Program     = auto()    
     Block       = auto()    
-    Assignment  = auto()    
+    Assignment  = auto() 
+    Pipeline    = auto()   
+    Binding     = auto()   
     FieldDecl   = auto()    
     Return      = auto()    
     Expression  = auto()    
     Store       = auto()    
-    Loop        = auto()    
     LoopControl = auto()    
 
 @dataclass
@@ -36,15 +37,38 @@ class ASTParser:
     @property
     def current_node(self):
         return self.stack[-1]
-
+    def _get_context(self, offset=0):
+        """Helper to print a window of tokens around the error."""
+        idx = min(max(0, self.i + offset), len(self.tokens) - 1)
+        if not self.tokens: return "Empty file"
+        start = max(0, idx - 10)
+        end = min(len(self.tokens), idx + 10)
+        
+        out =[]
+        for j in range(start, end):
+            val = str(getattr(self.tokens[j], 'value', type(self.tokens[j]).__name__))
+            if j == idx:
+                out.append(f"\n   >>> {val} <<<   \n")
+            else:
+                out.append(val)
+        return " ".join(out)
     def parse(self) -> ASTNode:
-        while self.i < len(self.tokens):
-            token = self.tokens[self.i]
+        try:
+            while self.i < len(self.tokens):
+                token = self.tokens[self.i]
+                
+                # Dynamic Dispatch
+                method_name = f"parse_{type(token).__name__}"
+                visitor = getattr(self, method_name, self.parse_default)
+                visitor(token)
+                
+        except Exception as e:
+            # Catch ANY syntax error/crash and attach the token window!
+            raise SyntaxError(f"{str(e)}\n\nError near tokens:\n{self._get_context()}") from None
             
-            # Dynamic Dispatch
-            method_name = f"parse_{type(token).__name__}"
-            visitor = getattr(self, method_name, self.parse_default)
-            visitor(token)
+        # Catch unclosed { loops at the end of the file
+        if len(self.stack) > 1:
+            raise SyntaxError(f"Missing '}}' (Stack has {len(self.stack) - 1} unclosed blocks)\nNear end of file:\n{self._get_context(-1)}")
             
         return self.root
 
@@ -58,12 +82,26 @@ class ASTParser:
     def parse_Identifier(self, token: Identifier):
         name = token.value
         start_i = self.i  
+
+
+
         while self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("."):
+            if self.i + 2 < len(self.tokens) and self.tokens[self.i+2] == Symbol("@"):
+                if (self.i + 6 < len(self.tokens) and 
+                    isinstance(self.tokens[self.i+3], Identifier) and self.tokens[self.i+3].value == "op" and
+                    self.tokens[self.i+4] == Symbol("(") and
+                    self.tokens[self.i+6] == Symbol(")")):
+                    
+                    op_sym = self.tokens[self.i+5].value
+                    name += f".__op_{op_sym}"
+                    self.i += 6
+                    continue
             if self.i + 2 < len(self.tokens) and isinstance(self.tokens[self.i+2], Identifier):
                 name += "." + self.tokens[self.i+2].value
                 self.i += 2
             else:
                 break
+
         if self.i + 1 < len(self.tokens):
             next_tok = self.tokens[self.i+1]
             if next_tok == Symbol("="):
@@ -100,7 +138,7 @@ class ASTParser:
             if len(self.stack) > 1:
                 popped_node = self.stack.pop()
             else:
-                raise SyntaxError("Unexpected '}' - Stack underflow")
+                raise SyntaxError(f"Unexpected '}}' - Stack underflow\nError near tokens:\n{self._get_context()}")
             self.i += 1
             
             # Pipeline Logic: Look ahead to map context output ( e.g., `} : result;` )
@@ -221,69 +259,99 @@ class ASTParser:
         
         store_node.children.append(ASTNode(NodeType.Expression, expr=expression.parse_expression(val_tokens)))
         self.i = k
-
-    def parse_assignment(self, name: str):
-        self.i += 2 
+    
+    def parse_binding(self, name_toks, expr_toks) -> ASTNode:
+        node = ASTNode(NodeType.Binding)
         
-        # Context Mapping: name = (args) : { ...
+        # Parse RHS Name or Type Constraints
+        if len(name_toks) == 1 and isinstance(name_toks[0], Identifier):
+            node.identifier = name_toks[0].value
+        elif len(name_toks) >= 4 and isinstance(name_toks[0], Identifier) and name_toks[1] == Symbol("["):
+            node.identifier = name_toks[0].value
+            if name_toks[2] == Symbol(":"):  # e.g., bytes[:4]
+                node.is_type = True
+                node.expr = expression.parse_expression(name_toks[3:-1])
+            else: # e.g., self[int]
+                if isinstance(name_toks[2], Identifier):
+                    node.type_name = name_toks[2].value
+                    
+        # Parse LHS (Initial value or stream)
+        if expr_toks:
+            node.expr = expression.parse_expression(expr_toks)
+            
+        return node
+    
+    def parse_assignment(self, name: str):
+        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol("="):
+            self.i += 1
+        if self.i < len(self.tokens) and self.tokens[self.i] == Symbol("="):
+            self.i += 1 
+        
+        # Pipeline check: name = ( bindings ) : { ... } : return;
         is_pipeline = False
         if self.i < len(self.tokens) and self.tokens[self.i] == Symbol("("):
             j = self.i
             balance = 0
             while j < len(self.tokens):
-                if self.tokens[j] == Symbol("("): 
-                    balance += 1
+                if self.tokens[j] == Symbol("("): balance += 1
                 elif self.tokens[j] == Symbol(")"): 
                     balance -= 1
-                    if balance == 0: 
-                        break
+                    if balance == 0: break
                 j += 1
-            # BUGFIX: Evaluates `j+1` (which is `:`) instead of `j` (which is `)`)
-            if j+1 < len(self.tokens) and self.tokens[j+1] == Symbol(":"):
-                if j+2 < len(self.tokens) and self.tokens[j+2] == Symbol("{"):
-                    is_pipeline = True
+            if j < len(self.tokens) and self.tokens[j] == Symbol(")"):
+                if j+1 < len(self.tokens) and self.tokens[j+1] == Symbol(":"):
+                    if j+2 < len(self.tokens) and self.tokens[j+2] == Symbol("{"):
+                        is_pipeline = True
                     
         if is_pipeline:
-            assign_node = ASTNode(NodeType.Assignment, identifier=name)
-            self.current_node.children.append(assign_node)
-            
+            pipeline_node = ASTNode(NodeType.Pipeline, identifier=name)
+            self.current_node.children.append(pipeline_node)
             self.i += 1 # Skip `(`
-            args = []
-            arg_constraints =[]
-            is_type = False
+            
+            bindings_block = ASTNode(NodeType.Block)
+            pipeline_node.children.append(bindings_block)
             
             while self.i < len(self.tokens) and self.tokens[self.i] != Symbol(")"):
-                if isinstance(self.tokens[self.i], Identifier):
-                    args.append(self.tokens[self.i].value)
+                bind_toks = []
+                while self.i < len(self.tokens) and self.tokens[self.i] not in (Symbol(","), Symbol(")")):
+                    bind_toks.append(self.tokens[self.i])
+                    self.i += 1
                     
-                    # Peek ahead for constraint: e.g., `bytes[:4]` or `self[int]`
-                    if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("["):
-                        self.i += 2 # Skip ident and `[`
-                        constraint_toks = []
+                if bind_toks:
+                    is_assign = False
+                    for idx, t in enumerate(bind_toks):
+                        if t == Symbol("="):
+                            name_toks = bind_toks[:idx]
+                            expr_toks = bind_toks[idx+1:]
+                            bindings_block.children.append(self.parse_binding(name_toks, expr_toks))
+                            is_assign = True
+                            break
+                    if not is_assign:
+                        bindings_block.children.append(self.parse_binding(bind_toks, []))
                         
-                        # If the constraint starts with ':', it's a Space Slice! This is a Type!
-                        if self.i < len(self.tokens) and self.tokens[self.i] == Symbol(":"):
-                            is_type = True 
-                            
-                        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol("]"):
-                            constraint_toks.append(self.tokens[self.i])
-                            self.i += 1
-                        arg_constraints.append(constraint_toks)
-                    else:
-                        arg_constraints.append([])
-                self.i += 1
+                if self.tokens[self.i] == Symbol(","):
+                    self.i += 1
                 
             self.i += 1 # Skip `)`
             self.i += 2 # Skip `:` and `{`
             
-            block_node = ASTNode(NodeType.Block)
-            block_node.args = args
-            block_node.arg_constraints = arg_constraints
-            block_node.is_type = is_type
-            
-            assign_node.children.append(block_node)
-            self.stack.append(block_node)
+            body_node = ASTNode(NodeType.Block)
+            pipeline_node.children.append(body_node)
+            self.stack.append(body_node)
             return
+            
+        # Standard Primitive / Value Assignment
+        assign_node = ASTNode(NodeType.Assignment, identifier=name)
+        self.current_node.children.append(assign_node)
+        
+        expr_tokens = []
+        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol(";"):
+            expr_tokens.append(self.tokens[self.i])
+            self.i += 1
+            
+        if expr_tokens:
+            expr_tree = expression.parse_expression(expr_tokens)
+            assign_node.children.append(ASTNode(NodeType.Expression, expr=expr_tree))
             
         # Standard Primitive / Value Assignment
         assign_node = ASTNode(NodeType.Assignment, identifier=name)

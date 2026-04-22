@@ -21,6 +21,7 @@ class SymbolInfo:
     l_end: str = ""
     var_offset: int = 0
     type_name: str = "" 
+    return_type: str = ""
 
 class Compiler:
     def __init__(self):
@@ -248,52 +249,94 @@ class Compiler:
         # 3. Compile the namespace'd AST natively into our context
         for child in imported_ast.children:
             self._compile_node(child)
-    def Assignment(self, node):
+    
+    def Pipeline(self, node):
         name = node.identifier
-        if node.children and node.children[0].node_type == NodeType.Expression:
-            expr_node = node.children[0].expr
-            if expr_node and expr_node.type == ExprNodeType.Macro and expr_node.value.value == "import":
-                # Stringify the path out of the raw token identifiers/symbols
-                path = "".join(str(t.value) for t in expr_node.children)
-                self._handle_import(name, path)
-                return
-        if node.children and node.children[0].node_type == NodeType.Block and node.children[0].args:
-            block_node = node.children[0]
+        bindings = node.children[0].children 
+        body = node.children[1]
+        
+        # The parser appends the `Return` node to the body block. Pull it out.
+        ret_node = None
+        if body.children and body.children[-1].node_type == NodeType.Return:
+            ret_node = body.children.pop()
+
+        # 1. Is it a Type Definition? (e.g., int = (bytes[:4]))
+        is_type = False
+        comptime_size = 0
+        if bindings and getattr(bindings[0], "is_type", False):
+            is_type = True
+            comptime_size = self._evaluate_comptime(bindings[0].expr)
+
+        if is_type:
+            self.types[name] = {"size": comptime_size, "methods": {}, "fields": {}}
+            prev = getattr(self, 'current_type_context', None)
+            self.current_type_context = name
             
-            if getattr(block_node, "is_type", False):
-                comptime_size = 0
-                for constraint in block_node.arg_constraints:
-                    if constraint and constraint[0] == Symbol(":"):
-                        expr_toks = constraint[1:]
-                        import expression 
-                        size_expr = expression.parse_expression(expr_toks)
-                        comptime_size = self._evaluate_comptime(size_expr)
-                        break
-                        
-                self.types[name] = {"size": comptime_size, "methods": {}}
-                print(f"[Comptime] Registered Type: {name} (Size: {comptime_size} bytes)")
-                
-                # Scan the block for methods like `value.add = (self, other) : { ... }`
-                for child in block_node.children:
-                    if child.node_type == NodeType.Assignment and "." in child.identifier:
-                        base, method_name = child.identifier.split(".", 1)
-                        if child.children and child.children[0].node_type == NodeType.Block:
-                            # Compile the method globally as a standard function!
-                            global_func_name = f"__{name}_{method_name}"
-                            self.types[name]["methods"][method_name] = global_func_name
-                            self._compile_function_def(global_func_name, child.children[0])
-                return 
-                
-            self._compile_function_def(name, block_node)
-        else:
-            child = node.children[0]
-            assigned_type = ""
-            if child.node_type == NodeType.Expression:
-                assigned_type = self._compile_expr(child.expr) or "" # Catch the type returned!
-            else:
+            self.enter_scope()
+            base_ident = bindings[0].identifier
+            self.declare_symbol(base_ident, type_name="bytes")
+            
+            for child in body.children:
                 self._compile_node(child)
                 
-            self.declare_symbol(name, type_name=assigned_type)
+            self.exit_scope()
+            self.current_type_context = prev
+            return
+
+        # 2. Is it a Method / Function?
+        is_loop = False
+        for b in bindings:
+            if b.expr and b.expr.type == ExprNodeType.BinaryOp and b.expr.value.value == ":":
+                is_loop = True
+                
+        if not is_loop and (self.current_stack_depth == 0 or getattr(self, 'current_type_context', None)):
+            func_name = name
+            if getattr(self, 'current_type_context', None):
+                method_name = name.split(".")[-1]
+                type_name = self.current_type_context
+                func_name = f"__{type_name}_{method_name}"
+                self.types[type_name]["methods"][method_name] = func_name
+                
+            self._compile_function_def(func_name, bindings, body, ret_node)
+            return
+
+        # 3. Otherwise, it's a Runtime Loop / Temporal Pipeline!
+        self._compile_loop(name, bindings, body, ret_node)
+
+    def Assignment(self, node):
+        name = node.identifier
+        
+        # Don't emit linear assembly for field defs inside a Type!
+        if getattr(self, 'current_type_context', None):
+            if node.children and node.children[0].node_type == NodeType.Expression:
+                val = self._evaluate_comptime(node.children[0].expr)
+                self.types[self.current_type_context]["fields"][name] = val
+            return
+
+        if "." in name:
+            base_name, field_name = name.split(".", 1)
+            sym = self.get_symbol(base_name)
+            if sym and sym.type_name in self.types:
+                if field_name in self.types[sym.type_name].get("fields", {}):
+                    offset_val = self.types[sym.type_name]["fields"][field_name]
+                    child = node.children[0]
+                    self._compile_expr(child.expr) if child.node_type == NodeType.Expression else self._compile_node(child)
+                    macros.pop(macros.t1) 
+                    self.current_stack_depth -= 4
+                    ptr_offset = (sym.offset_from_base - self.current_stack_depth)
+                    asm.load(macros.t0, macros.stack_ptr, ptr_offset)
+                    asm.store(macros.t0, offset_val, macros.t1)       
+                    return
+            raise ValueError(f"Cannot assign to field '{field_name}' on '{base_name}'")
+
+        child = node.children[0]
+        assigned_type = ""
+        if child.node_type == NodeType.Expression:
+            assigned_type = self._compile_expr(child.expr) or ""
+        else:
+            self._compile_node(child)
+            
+        self.declare_symbol(name, type_name=assigned_type)
 
     def Store(self, node):
         self._compile_expr(node.children[1].expr)
@@ -311,30 +354,37 @@ class Compiler:
         for child in node.children:
             self._compile_node(child)
 
-    def _compile_function_def(self, name: str, block_node: ASTNode):
+    def _compile_function_def(self, func_name: str, bindings: List[ASTNode], body: ASTNode, ret_node: ASTNode):
         end_label = self.get_unique_label("end_func")
         asm.jal(macros.x0, end_label)
         
-        asm.label(name)
-        
+        asm.label(func_name)
         old_depth = self.current_stack_depth
         self.current_stack_depth = 0  
         self.enter_scope()
         
         arg_offset = -4 
-        for arg in reversed(block_node.args):
+        for i in reversed(range(len(bindings))):
+            binding = bindings[i]
             info = SymbolInfo(
                 offset_from_base=arg_offset, 
                 is_function=False, 
-                arg_count=0
+                arg_count=0,
+                type_name=getattr(binding, "type_name", "")
             )
-            self.scopes[-1][arg] = info
+            self.scopes[-1][binding.identifier] = info
             arg_offset -= 4
 
-        for child in block_node.children:
+        for child in body.children:
             self._compile_node(child)
             
-        asm.addi(macros.a0, macros.x0, 0)
+        if ret_node:
+            self._compile_expr(ret_node.children[0].expr)
+            macros.pop(macros.t0)
+            asm.addi(macros.a0, macros.t0, 0)
+        else:
+            asm.addi(macros.a0, macros.x0, 0)
+            
         if self.current_stack_depth > 0:
             asm.addi(macros.stack_ptr, macros.stack_ptr, -self.current_stack_depth)
         asm.jalr(macros.x0, macros.ra, 0)
@@ -342,10 +392,90 @@ class Compiler:
         self.exit_scope()
         self.current_stack_depth = old_depth
         asm.label(end_label)
+    def _compile_loop(self, name, bindings, body, ret_node):
+        l_start = self.get_unique_label("loop_start")
+        l_end = self.get_unique_label("loop_end")
+        self.enter_scope()
+        
+        range_var = None
+        range_end_expr = None
+        
+        for b in bindings:
+            if b.expr and b.expr.type == ExprNodeType.BinaryOp and b.expr.value.value == ":":
+                range_var = b.identifier
+                self._compile_expr(b.expr.left)
+                range_end_expr = b.expr.right
+                self.declare_symbol(b.identifier, type_name=getattr(b, "type_name", ""))
+            elif b.expr:
+                self._compile_expr(b.expr)
+                self.declare_symbol(b.identifier, type_name=getattr(b, "type_name", ""))
+            else:
+                macros.push(macros.x0)
+                self.current_stack_depth += 4
+                self.declare_symbol(b.identifier, type_name=getattr(b, "type_name", ""))
+                
+        if range_end_expr:
+            self._compile_expr(range_end_expr)
+            end_limit_sym = self.declare_symbol(f"__end_limit_{range_var}")
+            
+        asm.label(l_start)
+        
+        if range_var and range_end_expr:
+            var_info = self.get_symbol(range_var)
+            end_info = self.get_symbol(f"__end_limit_{range_var}")
+            asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
+            asm.load(macros.t1, macros.stack_ptr, end_info.offset_from_base - self.current_stack_depth)
+            asm.bge(macros.t0, macros.t1, l_end)
+            
+        for child in body.children:
+            self._compile_node(child)
+            
+        acc_sym = None
+        for b in reversed(bindings):
+            if b.expr and not (b.expr.type == ExprNodeType.BinaryOp and b.expr.value.value == ":"):
+                acc_sym = self.get_symbol(b.identifier)
+                break
+                
+        if ret_node:
+            self._compile_expr(ret_node.children[0].expr) 
+            macros.pop(macros.t0)
+            self.current_stack_depth -= 4
+            if acc_sym:
+                asm.store(macros.stack_ptr, acc_sym.offset_from_base - self.current_stack_depth, macros.t0)
+                
+        if range_var:
+            var_info = self.get_symbol(range_var)
+            asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
+            asm.addi(macros.t0, macros.t0, 1)
+            asm.store(macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth, macros.t0)
+            
+        asm.jal(macros.x0, l_start)
+        asm.label(l_end)
+        
+        if acc_sym:
+            asm.load(macros.t0, macros.stack_ptr, acc_sym.offset_from_base - self.current_stack_depth)
+            macros.push(macros.t0)
+            self.current_stack_depth += 4
+        else:
+            macros.push(macros.x0)
+            self.current_stack_depth += 4
+            
+        self.exit_scope()
+        
+        macros.pop(macros.t0)
+        self.current_stack_depth -= 4
+        self.declare_symbol(name)
+        macros.push(macros.t0)
+        self.current_stack_depth += 4
+        
+        sym = self.get_symbol(name)
+        asm.store(macros.stack_ptr, sym.offset_from_base - self.current_stack_depth, macros.t0)
+
     def _evaluate_comptime(self, node: ExprNode) -> int:
-        """Evaluates an AST math expression during compilation."""
         if node.type == ExprNodeType.Value:
             return node.value.value
+        elif node.type == ExprNodeType.Identifier:
+            return 0  # Unknown identifiers (like "bytes" alias) compile as offset 0
         elif node.type == ExprNodeType.BinaryOp:
             left = self._evaluate_comptime(node.left)
             right = self._evaluate_comptime(node.right)
@@ -358,7 +488,7 @@ class Compiler:
                 return left * right
             if op == "/": 
                 return left // right
-        raise ValueError(f"Space slice [:expr] must be a compile-time constant. Got: {node.type}")
+        raise ValueError("Space slice [:expr] must be a compile-time constant.")
     
     def _compile_expr(self, node: ExprNode):
         match node.type:
@@ -453,7 +583,18 @@ class Compiler:
                     macros.push(rd_reg_to_push)
                     self.current_stack_depth += 4
                     return None
-                    
+                  
+                elif macro_name == "op":
+                    op_sym = child.identifier[4:-1] 
+    
+                    global_func_name = f"__{name}_op_{op_sym}"
+
+                    # Store it in an "ops" dict next to "methods"
+                    if "ops" not in self.types[name]:
+                        self.types[name]["ops"] = {}
+                    self.types[name]["ops"][op_sym] = global_func_name
+
+                    self._compile_function_def(global_func_name, child.children[0])
                 else:
                     raise SyntaxError(f"Unknown macro @{macro_name}")
 
@@ -466,9 +607,41 @@ class Compiler:
                 asm.load(macros.t1, macros.t0, 0)
                 macros.push(macros.t1)
             case ExprNodeType.Identifier:
-                sym = self.get_symbol(node.value.value)
+                var_name = node.value.value
+                
+                # Handle Dot Access
+                if "." in var_name:
+                    base_name, field_name = var_name.split(".", 1)
+                    
+                    # 1. Type Constant? (e.g. `lexer.STATE_DEFAULT`)
+                    if base_name in self.types and field_name in self.types[base_name].get("fields", {}):
+                        val = self.types[base_name]["fields"][field_name]
+                        macros.push_value(val)
+                        self.current_stack_depth += 4
+                        return None
+                        
+                    # 2. Instance Memory Read? (e.g. `player.health`)
+                    sym = self.get_symbol(base_name)
+                    if not sym: 
+                        raise ValueError(f"Undefined variable: {base_name}")
+                        
+                    if sym.type_name in self.types and field_name in self.types[sym.type_name].get("fields", {}):
+                        offset_val = self.types[sym.type_name]["fields"][field_name]
+                        ptr_offset = (sym.offset_from_base - self.current_stack_depth)
+                        
+                        asm.load(macros.t0, macros.stack_ptr, ptr_offset) # Base Pointer
+                        asm.load(macros.t1, macros.t0, offset_val)        # Memory Read at Base+Offset
+                        
+                        macros.push(macros.t1)
+                        self.current_stack_depth += 4
+                        return None
+                        
+                    raise ValueError(f"Cannot read field '{field_name}' on '{base_name}'")
+
+                # Standard variable read
+                sym = self.get_symbol(var_name)
                 if not sym: 
-                    raise ValueError(f"Undefined variable: {node.value.value}")
+                    raise ValueError(f"Undefined variable: {var_name}")
                 
                 offset = (sym.offset_from_base - self.current_stack_depth) 
                 asm.load(macros.t0, macros.stack_ptr, offset) 
@@ -477,9 +650,46 @@ class Compiler:
                 return sym.type_name
 
             case ExprNodeType.BinaryOp:
-                self._compile_expr(node.left)
-                self._compile_expr(node.right)
+                left_type = self._compile_expr(node.left)
+                op_sym = node.value.value
                 
+                # Check for operator overload dynamically
+                if left_type and left_type in self.types:
+                    type_info = self.types[left_type]
+                    method_name = f"__op_{op_sym}"
+                    
+                    if method_name in type_info.get("methods", {}):
+                        func_name = type_info["methods"][method_name]
+                        
+                        self._compile_expr(node.right)
+                        macros.pop(macros.t1) # Right
+                        macros.pop(macros.t0) # Left
+                        self.current_stack_depth -= 8
+                        
+                        asm.addi(macros.t2, macros.ra, 0)
+                        macros.push(macros.t2)
+                        self.current_stack_depth += 4
+                        
+                        macros.push(macros.t0)
+                        macros.push(macros.t1)
+                        self.current_stack_depth += 8
+                        
+                        asm.jal(macros.ra, func_name)
+                        asm.addi(macros.t2, macros.a0, 0)
+                        
+                        macros.pop(macros.x0)
+                        macros.pop(macros.x0)
+                        self.current_stack_depth -= 8
+                        
+                        macros.pop(macros.ra)
+                        self.current_stack_depth -= 4
+                        
+                        macros.push(macros.t2)
+                        self.current_stack_depth += 4
+                        return left_type 
+                    
+                # Primitive Fallback
+                self._compile_expr(node.right)
                 macros.pop(macros.t1)
                 macros.pop(macros.t0)
                 self.current_stack_depth -= 8
@@ -580,11 +790,16 @@ class Compiler:
                 macros.push(macros.t2)
                 self.current_stack_depth += 4
 
+                sym = self.get_symbol(func_name)
+                if sym and sym.return_type:
+                    return sym.return_type
+                return "int" # Fallback primitive
+
             case ExprNodeType.ArrayAlloc:
                 size = self._evaluate_comptime(node.left) 
                 macros.push(macros.stack_ptr) 
                 self.current_stack_depth += 4
                 
-                # Raw bytes allocation instead of size * 4
+                # Raw bytes allocation
                 asm.addi(macros.stack_ptr, macros.stack_ptr, size)
                 self.current_stack_depth += size

@@ -82,6 +82,17 @@ class ExpressionParser:
         
         # Combine dot notations
         while self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("."):
+            if self.i + 2 < len(self.tokens) and self.tokens[self.i+2] == Symbol("@"):
+                # Detect .@op(+)
+                if (self.i + 6 < len(self.tokens) and 
+                    isinstance(self.tokens[self.i+3], Identifier) and self.tokens[self.i+3].value == "op" and
+                    self.tokens[self.i+4] == Symbol("(") and
+                    self.tokens[self.i+6] == Symbol(")")):
+                    
+                    op_sym = self.tokens[self.i+5].value
+                    name += f".__op_{op_sym}"
+                    self.i += 6
+                    continue
             if self.i + 2 < len(self.tokens) and isinstance(self.tokens[self.i+2], Identifier):
                 name += "." + self.tokens[self.i+2].value
                 self.i += 2
@@ -154,7 +165,7 @@ class ExpressionParser:
         handler(token)
 
     def Symbol_At(self, token: Symbol):
-        # Parses: @asm(...), @embed(...), @import(...)
+        # Parses: @asm(...), @embed(...), @import(...), @op(...)
         self.i += 1
         macro_name = self.tokens[self.i] # Expecting Identifier("asm")
         self.i += 2 # Skip name and '('
@@ -237,6 +248,9 @@ class ExpressionParser:
         if token not in tokens.weight_dict:
             return 
             
+        if token == Symbol(":") and not self.output_queue:
+            self.output_queue.append(ExprNode(ExprNodeType.Value, value=Value(0)))
+            
         prec = get_precedence(token)
         while (self.operator_stack and 
                isinstance(self.operator_stack[-1], Symbol) and 
@@ -245,7 +259,6 @@ class ExpressionParser:
             
             top_op = self.operator_stack.pop()
             
-            # 2. Add safety check instead of throwing an IndexError
             if len(self.output_queue) < 2:
                 raise SyntaxError(f"Invalid Expression: Not enough operands for '{top_op.value}'")
                 
