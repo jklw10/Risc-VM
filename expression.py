@@ -58,6 +58,7 @@ class ExpressionParser:
         if not self.output_queue:
             return None
         return self.output_queue[0]
+        
     def parse_Keyword(self, token: Keyword):
         if token == Keyword("alloc"):
             if self.i+1 < len(self.tokens) and self.tokens[self.i+1] == Symbol("[") and self.tokens[self.i+2] == Symbol(":"):
@@ -74,6 +75,7 @@ class ExpressionParser:
                 raise SyntaxError("Invalid alloc syntax")
         else:
             self.parse_default(token)
+            
     def parse_Value(self, token: Value):
         self.output_queue.append(ExprNode(ExprNodeType.Value, value=token))
 
@@ -103,7 +105,7 @@ class ExpressionParser:
             func_name = token
             self.i += 2 
             args = []
-            current_arg_tokens = []
+            current_arg_tokens =[]
             balance = 1
             
             while self.i < len(self.tokens):
@@ -117,7 +119,7 @@ class ExpressionParser:
                 elif cur_token == Symbol(",") and balance == 1:
                     if current_arg_tokens:
                         args.append(parse_expression(current_arg_tokens))
-                        current_arg_tokens = []
+                        current_arg_tokens =[]
                     self.i += 1
                     continue
                 
@@ -133,7 +135,7 @@ class ExpressionParser:
             # Array Read Syntax: ident[idx]
             name = token
             self.i += 2
-            idx_tokens = []
+            idx_tokens =[]
             balance = 1
             while self.i < len(self.tokens):
                 cur = self.tokens[self.i]
@@ -144,7 +146,7 @@ class ExpressionParser:
                 idx_tokens.append(cur)
                 self.i += 1
             
-            # Resolves dynamically to raw pointer arithmetic (No * 4 for byte mapping)
+            # Resolves dynamically to raw pointer arithmetic
             idx_expr = parse_expression(idx_tokens)
             add_node = ExprNode(ExprNodeType.BinaryOp, value=Symbol("+"), left=ExprNode(ExprNodeType.Identifier, value=name), right=idx_expr)
             deref_node = ExprNode(ExprNodeType.Deref, left=add_node)
@@ -159,25 +161,54 @@ class ExpressionParser:
             "[": self.Symbol_LBracket,
             "(": self.Symbol_LParen,
             ")": self.Symbol_RParen,
-            "@": self.Symbol_At,   
+            "@": self.Symbol_At,      
+            ".": self.Symbol_Dot,
+
         }
         handler = symbol_map.get(token.value, self.Symbol_Operator)
         handler(token)
 
+
+    def Symbol_Dot(self, token: Symbol):
+        if self.i + 1 < len(self.tokens) and (isinstance(self.tokens[self.i+1], Identifier) or self.tokens[self.i+1] == Symbol("@")):
+            self.i -= 1
+            self.parse_Identifier(tokens.Identifier(""))
+        else:
+            self.Symbol_Operator(token)
+
     def Symbol_At(self, token: Symbol):
         # Parses: @asm(...), @embed(...), @import(...), @op(...)
         self.i += 1
-        macro_name = self.tokens[self.i] # Expecting Identifier("asm")
-        self.i += 2 # Skip name and '('
+        macro_name = self.tokens[self.i] 
         
-        raw_tokens = []
-        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol(")"):
-            # Ignore commas for cleanliness
-            if self.tokens[self.i] != Symbol(","):
-                raw_tokens.append(self.tokens[self.i])
+        while self.i < len(self.tokens) and self.tokens[self.i] != Symbol("("):
             self.i += 1
             
-        self.output_queue.append(ExprNode(ExprNodeType.Macro, value=macro_name, children=raw_tokens))
+        if self.i < len(self.tokens) and self.tokens[self.i] == Symbol("("):
+            self.i += 1 
+        
+        args =[]
+        curr_arg =[]
+        balance = 1
+        while self.i < len(self.tokens):
+            t = self.tokens[self.i]
+            if t == Symbol("("): balance += 1
+            elif t == Symbol(")"):
+                balance -= 1
+                if balance == 0: break
+            
+            if t == Symbol(",") and balance == 1:
+                if curr_arg: 
+                    args.append(curr_arg)
+                    curr_arg =[]
+            else:
+                curr_arg.append(t)
+            self.i += 1
+            
+        if curr_arg:
+            args.append(curr_arg)
+            
+        self.output_queue.append(ExprNode(ExprNodeType.Macro, value=macro_name, children=args))
 
     def Symbol_LBracket(self, token: Symbol):
         if self.i + 1 < len(self.tokens) and self.tokens[self.i+1] == Symbol(":"):
@@ -203,8 +234,9 @@ class ExpressionParser:
             node = ExprNode(ExprNodeType.ArrayAlloc, left=inner_expr)
             self.output_queue.append(node)
             return
+            
         # Handle Raw Deref [ptr]
-        inner_tokens = []
+        inner_tokens =[]
         bracket_balance = 1
         self.i += 1 
         while self.i < len(self.tokens):
@@ -220,7 +252,7 @@ class ExpressionParser:
             self.i += 1
         
         if not inner_tokens:
-            raise SyntaxError("Empty [] dereference")
+            raise SyntaxError("Empty[] dereference")
             
         inner_expr = parse_expression(inner_tokens)
         node = ExprNode(ExprNodeType.Deref, left=inner_expr)
@@ -272,8 +304,6 @@ class ExpressionParser:
     def parse_default(self, token: Token):
         raise NotImplementedError(f"No expression for {token}")
 
-
-# Maintain the old entrypoint so `AST.py` doesn't need changing
 def parse_expression(token_list: List[Token]) -> Optional[ExprNode]:
     parser = ExpressionParser(token_list)
     return parser.parse()

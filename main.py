@@ -8,6 +8,49 @@ import AST
 import compiler
 import tokens
 import disasm 
+"""
+LANGUAGE DESIGN PHILOSOPHY & SPECIFICATION:
+No Primitive Types: 
+   The compiler natively has no concept of `int`, `float`, or `bool`. 
+   The implicit default type is raw memory (`bytes`).
+
+Types are Comptime Memory Slices: 
+   A "Type" is simply an alias for an allocation size on the stack. 
+   Example: `int = (bytes[:4])` tells the compiler to allocate 4 bytes.
+   
+   This should enable typed pointer's benefits?.
+
+Library-Defined Operations: 
+   Operators (+, -, *, ==) are not built-in. They are syntactic sugar for 
+   type methods (e.g., `value.@op(+)`). The Standard Library defines these 
+   using inline `@asm` mapped to raw CPU instructions.
+
+
+Data Movement (:) vs. Mutation (=):
+   `:` denotes value movement, type aliasing, or passing data across scopes.
+     it is "to", "0:4" = "0 to 4", (in):{ctx}:res, is a pipeline definition.
+   `=` denotes explicit identity assignment and runtime memory mutation.
+     it is "is", "res = 4"
+
+The Universal Pipeline Construct: 
+   Control flow, loops, functions, and type definitions are all Pipelines.
+   Format: `(bindings) : { body } : return_val`
+
+Pre-Declaration & Zero-Initialization:
+   Declaring a typed variable at a block boundary (e.g., `res[int] = ... : { }`) 
+   allocates and zero-initializes it in the outer scope, allowing inner 
+   blocks to mutate it explicitly without scope-popping issues.
+
+Zero-Overhead Inline Assembly:
+   `@asm(...)` seamlessly bridges high-level code and RISC-V assembly, 
+   automatically resolving local variable stack offsets and register pooling.
+
+Explicit mutation:
+  No hidden mutations, aka no side effects without visibility
+
+Caller is responsible for allocation.
+A pipeline's only purpose is to transform data.
+"""
 
 def load_cpu_lib():
     """Loads the RISC-V CPU C library."""

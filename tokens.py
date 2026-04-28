@@ -1,21 +1,6 @@
 from dataclasses import dataclass
 import re
 
-splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,.@?])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
-
-def tokenize(text):
-    text = re.sub(r'//.*', '', text)
-    token_strings = splitchartype.split(text)
-    tokens_out = []
-    for ts in token_strings:
-        if ts is None:
-            continue
-        ts = ts.strip()
-        if ts == "":
-            continue
-        tokens_out.append(from_string(ts))
-    return tokens_out
-
 @dataclass(frozen=True)
 class Token():
     pass
@@ -36,6 +21,7 @@ class Value(Token):
     value: int
 
 weight_dict = {
+    Symbol(":")   : 0,
     Symbol("==")  : 0,
     Symbol("!=")  : 0,
     Symbol("<")   : 0,
@@ -96,6 +82,24 @@ key_dict = {
     #"fn"        : Keyword("fn"    ),
 }
 
+
+#splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,.@?])|([0-9]+)|([a-zA-Z_][a-zA-Z0-9_]*)")
+
+splitchartype = re.compile(r"(==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,.@?])|([a-zA-Z0-9_]+)")
+
+def tokenize(text):
+    text = re.sub(r'//.*', '', text)
+    token_strings = splitchartype.split(text)
+    tokens_out = []
+    for ts in token_strings:
+        if ts is None:
+            continue
+        ts = ts.strip()
+        if ts == "":
+            continue
+        tokens_out.append(from_string(ts))
+    return tokens_out
+
 def from_string(text:str) -> Token:
     if text is None:
         return Invalid("None input")
@@ -103,8 +107,19 @@ def from_string(text:str) -> Token:
         return token
     if token := key_dict.get(text):
         return token
-    if text.isdigit():
-        return Value(int(text))
+        
+    # Strip underscores for number parsing (e.g. 0x0010_0001)
+    clean_text = text.replace("_", "")
+    
+    # Check if it's a number (Decimal, Hex, Binary)
+    if clean_text.isdigit():
+        return Value(int(clean_text))
+    if clean_text.lower().startswith("0x"):
+        return Value(int(clean_text, 16))
+    if clean_text.lower().startswith("0b"):
+        return Value(int(clean_text, 2))
+        
+    # If it's alphanumeric but not a pure number (like "01_typedef"), it's an Identifier
     return Identifier(text)
 
 def apply_function(token, op):
