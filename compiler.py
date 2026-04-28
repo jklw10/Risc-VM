@@ -333,6 +333,18 @@ class Compiler:
                 else:
                     raise ValueError(f"Ambiguous assignment inside Type {type_name}. Must start with '{type_name}.' or '{blueprint}.'")
             return
+            
+        # 3. Regular Variable Assignment
+        if node.children and node.children[0].node_type == NodeType.Expression:
+            self._compile_expr(node.children[0].expr)
+            sym = self.get_symbol(name)
+            if not sym:
+                self.declare_symbol(name, type_name=getattr(node, "type_name", ""))
+            else:
+                macros.pop(macros.t0)
+                self.current_stack_depth -= 4
+                offset = sym.offset_from_base - self.current_stack_depth
+                asm.store(macros.stack_ptr, offset, macros.t0)
     
     def Store(self, node):
         self._compile_expr(node.children[1].expr)
@@ -418,8 +430,10 @@ class Compiler:
             
         l_start = self.get_unique_label("loop_start")
         l_end = self.get_unique_label("loop_end")
+        
         self.enter_scope()
-
+        start_depth = self.current_stack_depth
+        
         # Temporarily clear context so we are compiling a runtime loop body
         old_type_ctx = getattr(self, 'current_type_context', None)
         old_blueprint_ctx = getattr(self, 'current_blueprint_context', None)
@@ -456,8 +470,7 @@ class Compiler:
             asm.load(macros.t1, macros.stack_ptr, end_info.offset_from_base - self.current_stack_depth)
             asm.bge(macros.t0, macros.t1, l_end)
             
-        for child in body.children:
-            self._compile_node(child)
+        self._compile_node(body)
                 
         if range_var:
             var_info = self.get_symbol(range_var)
@@ -468,22 +481,19 @@ class Compiler:
         asm.jal(macros.x0, l_start)
         asm.label(l_end)
         
-        # Load accumulated target context back to stack safely
-        asm.load(macros.t0, macros.stack_ptr, out_sym.offset_from_base - self.current_stack_depth)
+        # Free memory tied to local context loop variables to prevent stack offsets growing infinitely in blocks
+        diff = self.current_stack_depth - start_depth
+        if diff > 0:
+            asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
+            self.current_stack_depth = start_depth
             
-        macros.push(macros.t0)
-        self.current_stack_depth += 4
         self.exit_scope()
 
         # Restore context 
         self.current_type_context = old_type_ctx
         self.current_blueprint_context = old_blueprint_ctx
         
-        macros.pop(macros.t0)
-        self.current_stack_depth -= 4
-        asm.store(macros.stack_ptr, out_sym.offset_from_base - self.current_stack_depth, macros.t0)
-        
-        # Finally push to standard expr stack
+        asm.load(macros.t0, macros.stack_ptr, out_sym.offset_from_base - self.current_stack_depth)
         macros.push(macros.t0)
         self.current_stack_depth += 4
 
@@ -812,9 +822,23 @@ class Compiler:
                     return None
 
             case ExprNodeType.ArrayAlloc:
-                size = self._evaluate_comptime(node.left) 
-                macros.push(macros.stack_ptr) 
-                self.current_stack_depth += 4
-                
+                if node.left:
+                    size = self._evaluate_comptime(node.left)
+                elif node.value:
+                    if hasattr(node.value, "value"):
+                        size = int(node.value.value)
+                    else:
+                        size = int(node.value)
+                else:
+                    size = 0
+                    
+                # Allocate space FIRST 
                 asm.addi(macros.stack_ptr, macros.stack_ptr, size)
                 self.current_stack_depth += size
+                
+                # Calculate the start pointer (stack_ptr - size)
+                asm.addi(macros.t0, macros.stack_ptr, -size)
+                
+                # Push the start pointer to the stack (so it points to the beginning of the newly allocated space)
+                macros.push(macros.t0)
+                self.current_stack_depth += 4
