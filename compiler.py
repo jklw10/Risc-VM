@@ -163,6 +163,12 @@ class Compiler:
 
     def Pipeline(self, node):
         name = node.identifier
+        
+        # Apply current type context mapping to dot prefixes (e.g., .func -> int.func)
+        if name and name.startswith(".") and getattr(self, 'current_type_context', None):
+            name = self.current_type_context + name
+            node.identifier = name
+            
         bindings = node.children[0].children 
         body = node.children[1]
         loop_type_name = getattr(node, "type_name", "")
@@ -239,6 +245,11 @@ class Compiler:
 
     def StoreOrAssign(self, node):
         name = node.identifier
+        
+        if name and name.startswith(".") and getattr(self, 'current_type_context', None):
+            name = self.current_type_context + name
+            node.identifier = name
+            
         idx_name = getattr(node, "type_name", "")
         
         if idx_name == "" or idx_name in self.types or not self.get_symbol(name):
@@ -255,6 +266,10 @@ class Compiler:
     def Assignment(self, node):
         name = node.identifier
         
+        if name and name.startswith(".") and getattr(self, 'current_type_context', None):
+            name = self.current_type_context + name
+            node.identifier = name
+            
         if node.children and node.children[0].node_type == NodeType.Expression:
             child = node.children[0]
             
@@ -297,6 +312,7 @@ class Compiler:
                 
                 if aliased:
                     return 
+                    
         # Are we building a Type?
         if getattr(self, 'current_type_context', None):
             type_name = self.current_type_context
@@ -317,45 +333,7 @@ class Compiler:
                 else:
                     raise ValueError(f"Ambiguous assignment inside Type {type_name}. Must start with '{type_name}.' or '{blueprint}.'")
             return
-
-        if "." in name:
-            base_name, field_name = name.split(".", 1)
-            sym = self.get_symbol(base_name)
-            if sym and sym.type_name in self.types:
-                if field_name in self.types[sym.type_name].get("fields", {}):
-                    offset_val = self.types[sym.type_name]["fields"][field_name]
-                    child = node.children[0]
-                    self._compile_expr(child.expr) if child.node_type == NodeType.Expression else self._compile_node(child)
-                    macros.pop(macros.t1) 
-                    self.current_stack_depth -= 4
-                    ptr_offset = (sym.offset_from_base - self.current_stack_depth)
-                    asm.load(macros.t0, macros.stack_ptr, ptr_offset)
-                    asm.store(macros.t0, offset_val, macros.t1)       
-                    return
-            raise ValueError(f"Cannot assign to field '{field_name}' on '{base_name}'")
-        
-        sym = self.get_symbol(name)
-        is_new = sym is None
-        decl_type = getattr(node, "type_name", "")
-
-        if is_new:
-            sym = self.declare_symbol(name, type_name=decl_type)
-            macros.push(macros.x0)
-            self.current_stack_depth += 4
-            
-        child = node.children[0]
-        if child.node_type == NodeType.Expression:
-            assigned_type = self._compile_expr(child.expr) or ""
-            if assigned_type and not decl_type:
-                sym.type_name = assigned_type
-        else:
-            self._compile_node(child)
-
-        macros.pop(macros.t0)
-        self.current_stack_depth -= 4
-        offset = sym.offset_from_base - self.current_stack_depth
-        asm.store(macros.stack_ptr, offset, macros.t0)
-
+    
     def Store(self, node):
         self._compile_expr(node.children[1].expr)
         self._compile_expr(node.children[0].expr)
@@ -638,10 +616,14 @@ class Compiler:
             case ExprNodeType.Identifier:
                 var_name = node.value.value
                 
+                # Context-prefixed identifiers (e.g. `.max` -> `int.max`)
+                if var_name.startswith(".") and getattr(self, 'current_type_context', None):
+                    var_name = self.current_type_context + var_name
+                    
                 if "." in var_name:
                     base_name, field_name = var_name.split(".", 1)
                     
-                    # 1. Type Constant / Static? (Reads from our new 'statics' dict)
+                    # 1. Type Constant / Static? (Reads from our 'statics' dict)
                     if base_name in self.types and field_name in self.types[base_name].get("statics", {}):
                         val = self.types[base_name]["statics"][field_name]
                         macros.push_value(val)
@@ -749,11 +731,47 @@ class Compiler:
             case ExprNodeType.Call:
                 func_name = node.value.value
                 
+                # Context-prefixed methods (e.g. `.sum_n()`)
+                if func_name.startswith(".") and getattr(self, 'current_type_context', None):
+                    func_name = self.current_type_context + func_name
+                
                 if func_name in self.types:
                     if not node.children: raise ValueError(f"Instantiation {func_name} requires an allocation argument.")
                     self._compile_expr(node.children[0]) 
                     return func_name 
                     
+                # 1. Check if it's a Static Namespace/Type Function (Without requiring self-ptr instantiation)
+                if "." in func_name:
+                    base_var, method = func_name.split(".", 1)
+                    if base_var in self.types and method in self.types[base_var].get("methods", {}):
+                        real_func_name = self.types[base_var]["methods"][method]
+                        
+                        asm.addi(macros.t0, macros.ra, 0)
+                        macros.push(macros.t0)
+                        self.current_stack_depth += 4
+                        
+                        for arg in node.children:
+                            self._compile_expr(arg)
+                            
+                        asm.jal(macros.ra, real_func_name)
+                        asm.addi(macros.t2, macros.a0, 0) 
+                        
+                        for _ in node.children:
+                             macros.pop(macros.x0) 
+                             self.current_stack_depth -= 4
+                        
+                        macros.pop(macros.ra)
+                        self.current_stack_depth -= 4
+                        
+                        macros.push(macros.t2)
+                        self.current_stack_depth += 4
+                        
+                        sym = self.get_symbol(real_func_name)
+                        if sym and sym.return_type:
+                            return sym.return_type
+                        return "byte"
+                
+                # 2. Check if it's an Instance Method (Requires initialized local pointer)
                 if "." in func_name:
                     base_var, method = func_name.split(".", 1)
                     sym = self.get_symbol(base_var)
@@ -781,6 +799,7 @@ class Compiler:
                     asm.jal(macros.ra, real_func_name)
                     asm.addi(macros.t2, macros.a0, 0) 
                     
+                    # Pop arguments + instance pointer
                     for _ in range(len(node.children) + 1):
                          macros.pop(macros.x0) 
                          self.current_stack_depth -= 4
@@ -791,31 +810,6 @@ class Compiler:
                     macros.push(macros.t2)
                     self.current_stack_depth += 4
                     return None
-                    
-                asm.addi(macros.t0, macros.ra, 0)
-                macros.push(macros.t0)
-                self.current_stack_depth += 4
-
-                for arg in node.children:
-                    self._compile_expr(arg)
-                
-                asm.jal(macros.ra, func_name)
-                asm.addi(macros.t2, macros.a0, 0) 
-
-                for _ in node.children:
-                     macros.pop(macros.x0) 
-                     self.current_stack_depth -= 4
-                
-                macros.pop(macros.ra)
-                self.current_stack_depth -= 4
-                
-                macros.push(macros.t2)
-                self.current_stack_depth += 4
-
-                sym = self.get_symbol(func_name)
-                if sym and sym.return_type:
-                    return sym.return_type
-                return "byte" 
 
             case ExprNodeType.ArrayAlloc:
                 size = self._evaluate_comptime(node.left) 
