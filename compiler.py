@@ -1,3 +1,4 @@
+
 import macros
 from macros import asm
 from AST import NodeType, ASTNode
@@ -191,13 +192,11 @@ class Compiler:
             comptime_size = self._evaluate_comptime(bindings[0].expr)
 
         if is_type:
-            # We now separate methods, instance fields, and static constants!
             self.types[name] = {"size": comptime_size, "methods": {}, "fields": {}, "statics": {}}
             prev_type = getattr(self, 'current_type_context', None)
             prev_blueprint = getattr(self, 'current_blueprint_context', None)
             
             self.current_type_context = name
-            # Grab the instance blueprint name (defaults to "value" if omitted)
             self.current_blueprint_context = outputs[0]["name"] if outputs and outputs[0]["name"] else "value"
             
             self.enter_scope()
@@ -323,11 +322,9 @@ class Compiler:
                 
                 # Check namespace explicitly!
                 if name.startswith(f"{type_name}."):
-                    # Static context (e.g., int.max = 0xffff)
                     static_name = name[len(type_name)+1:]
                     self.types[type_name]["statics"][static_name] = val
                 elif name.startswith(f"{blueprint}.") or name == blueprint:
-                    # Instance context (e.g., value = bytes  OR  value.high = ...)
                     field_name = name[len(blueprint)+1:] if name != blueprint else "self"
                     self.types[type_name]["fields"][field_name] = val
                 else:
@@ -361,6 +358,7 @@ class Compiler:
     def Program(self, node):
         for child in node.children:
             self._compile_node(child)
+        asm.ecall()
 
     def _compile_function_def(self, func_name: str, bindings: List[ASTNode], body: ASTNode, ret_node: ASTNode, outputs: list = None):
         end_label = self.get_unique_label("end_func")
@@ -371,7 +369,7 @@ class Compiler:
         self.current_stack_depth = 0  
         self.enter_scope()
 
-        # Temporarily clear context so we are compiling a runtime method body (Not static schema)
+        # Temporarily clear context so we are compiling a runtime method body
         old_type_ctx = getattr(self, 'current_type_context', None)
         old_blueprint_ctx = getattr(self, 'current_blueprint_context', None)
         self.current_type_context = None
@@ -393,10 +391,10 @@ class Compiler:
         if outputs:
             for out in outputs:
                 if out["name"]:
-                    sym = self.declare_symbol(out["name"], type_name=out["type"])
-                    sym.return_type = out["type"]
                     macros.push(macros.x0)
                     self.current_stack_depth += 4
+                    sym = self.declare_symbol(out["name"], type_name=out["type"])
+                    sym.return_type = out["type"]
 
         for child in body.children:
             self._compile_node(child)
@@ -404,6 +402,8 @@ class Compiler:
         if ret_node:
             self._compile_expr(ret_node.children[0].expr)
             macros.pop(macros.t0)
+            
+            self.current_stack_depth -= 4  
             asm.addi(macros.a0, macros.t0, 0)
         else:
             asm.addi(macros.a0, macros.x0, 0)
@@ -492,10 +492,6 @@ class Compiler:
         # Restore context 
         self.current_type_context = old_type_ctx
         self.current_blueprint_context = old_blueprint_ctx
-        
-        asm.load(macros.t0, macros.stack_ptr, out_sym.offset_from_base - self.current_stack_depth)
-        macros.push(macros.t0)
-        self.current_stack_depth += 4
 
     def _evaluate_comptime(self, node: ExprNode) -> int:
         if node.type == ExprNodeType.Value:
