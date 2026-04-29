@@ -1,6 +1,7 @@
 import struct
 
 class RiscVAssembler:
+    REGISTER_SIZE = 4 
     def __init__(self):
         self.code = bytearray()
         self.labels = {}
@@ -122,7 +123,18 @@ class RiscVAssembler:
         
     def store(self, rs1, offset, rs2): 
         self._s_type(0x23, rs1, rs2, offset, 0x2) 
+    
+    def lw(self, rd, rs1, offset): 
+        self._i_type(0x03, rd, rs1, offset, 0x2)
+        
+    def sw(self, rs1, offset, rs2): 
+        self._s_type(0x23, rs1, rs2, offset, 0x2) 
 
+    def lbu(self, rd, rs1, offset):
+        self._i_type(0x03, rd, rs1, offset, 0x4)
+        
+    def sb(self, rs1, offset, rs2):
+        self._s_type(0x23, rs1, rs2, offset, 0x0)
     # --- Branching ---
     def jal(self, rd, label):
         offset = self._resolve_or_record(label, 'J')

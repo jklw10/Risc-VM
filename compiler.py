@@ -39,7 +39,7 @@ class Compiler:
         return None
 
     def declare_symbol(self, name: str, is_fn=False, args=0, type_name=""):
-        info = SymbolInfo(offset_from_base=self.current_stack_depth-4,
+        info = SymbolInfo(offset_from_base=self.current_stack_depth - asm.REGISTER_SIZE,
                            is_function=is_fn, arg_count=args, type_name=type_name)
         self.scopes[-1][name] = info
         return info
@@ -76,7 +76,7 @@ class Compiler:
                 self._compile_node(child)
                 
             macros.pop(macros.t0) 
-            self.current_stack_depth -= 4
+            self.current_stack_depth -= asm.REGISTER_SIZE
             asm.addi(macros.a0, macros.t0, 0)
         else:
             asm.addi(macros.a0, macros.x0, 0)
@@ -90,7 +90,7 @@ class Compiler:
         if node.expr:
             self._compile_expr(node.expr)
             macros.pop(macros.t0)
-            self.current_stack_depth -= 4
+            self.current_stack_depth -= asm.REGISTER_SIZE
 
     def FieldDecl(self, node):
         child = node.children[0]
@@ -339,21 +339,46 @@ class Compiler:
                 self.declare_symbol(name, type_name=getattr(node, "type_name", ""))
             else:
                 macros.pop(macros.t0)
-                self.current_stack_depth -= 4
+                self.current_stack_depth -= asm.REGISTER_SIZE
                 offset = sym.offset_from_base - self.current_stack_depth
                 asm.store(macros.stack_ptr, offset, macros.t0)
     
     def Store(self, node):
-        self._compile_expr(node.children[1].expr)
-        self._compile_expr(node.children[0].expr)
-        macros.pop_mem()
-        self.current_stack_depth -= 8
+        val_type = self._compile_expr(node.children[1].expr)
+        ptr_type = self._compile_expr(node.children[0].expr)
+        
+        macros.pop(macros.t0) # ptr
+        macros.pop(macros.t1) # val
+        self.current_stack_depth -= asm.REGISTER_SIZE * 2
+        
+        size = asm.REGISTER_SIZE
+        if val_type and val_type in self.types:
+            size = self.types[val_type].get("size", asm.REGISTER_SIZE)
+            
+        if size == 1:
+            asm.sb(macros.t0, 0, macros.t1)
+        elif size == 2:
+            asm.sh(macros.t0, 0, macros.t1)
+        else:
+            asm.sw(macros.t0, 0, macros.t1)
 
-    def Deref(self, node):
+    def Deref(self, node, expected_type=None):
         self._compile_expr(node.left)
         macros.pop(macros.t0) 
-        asm.load(macros.t1, macros.t0, 0)
+        
+        size = asm.REGISTER_SIZE
+        if expected_type and expected_type in self.types:
+            size = self.types[expected_type].get("size", asm.REGISTER_SIZE)
+            
+        if size == 1:
+            asm.lbu(macros.t1, macros.t0, 0)
+        elif size == 2:
+            asm.lhu(macros.t1, macros.t0, 0)
+        else:
+            asm.lw(macros.t1, macros.t0, 0)
+            
         macros.push(macros.t1)
+        return expected_type
 
     def Program(self, node):
         for child in node.children:
@@ -375,7 +400,7 @@ class Compiler:
         self.current_type_context = None
         self.current_blueprint_context = None
         
-        arg_offset = -4 
+        arg_offset = -asm.REGISTER_SIZE
         for i in reversed(range(len(bindings))):
             binding = bindings[i]
             info = SymbolInfo(
@@ -385,14 +410,14 @@ class Compiler:
                 type_name=getattr(binding, "type_name", "")
             )
             self.scopes[-1][binding.identifier] = info
-            arg_offset -= 4
+            arg_offset -= asm.REGISTER_SIZE
 
         # Automatically Allocate & Zero-Initialize Output Arguments
         if outputs:
             for out in outputs:
                 if out["name"]:
                     macros.push(macros.x0)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     sym = self.declare_symbol(out["name"], type_name=out["type"])
                     sym.return_type = out["type"]
 
@@ -403,7 +428,7 @@ class Compiler:
             self._compile_expr(ret_node.children[0].expr)
             macros.pop(macros.t0)
             
-            self.current_stack_depth -= 4  
+            self.current_stack_depth -= asm.REGISTER_SIZE  
             asm.addi(macros.a0, macros.t0, 0)
         else:
             asm.addi(macros.a0, macros.x0, 0)
@@ -426,7 +451,7 @@ class Compiler:
         if not out_sym:
             out_sym = self.declare_symbol(name, type_name=loop_type_name)
             macros.push(macros.x0)
-            self.current_stack_depth += 4
+            self.current_stack_depth += asm.REGISTER_SIZE
             
         l_start = self.get_unique_label("loop_start")
         l_end = self.get_unique_label("loop_end")
@@ -454,7 +479,7 @@ class Compiler:
                 self.declare_symbol(b.identifier, type_name=getattr(b, "type_name", ""))
             else:
                 macros.push(macros.x0)
-                self.current_stack_depth += 4
+                self.current_stack_depth += asm.REGISTER_SIZE
                 self.declare_symbol(b.identifier, type_name=getattr(b, "type_name", ""))
                 
         if range_end_expr:
@@ -466,18 +491,18 @@ class Compiler:
         if range_var and range_end_expr:
             var_info = self.get_symbol(range_var)
             end_info = self.get_symbol(f"__end_limit_{range_var}")
-            asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
-            asm.load(macros.t1, macros.stack_ptr, end_info.offset_from_base - self.current_stack_depth)
+            asm.lw(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
+            asm.lw(macros.t1, macros.stack_ptr, end_info.offset_from_base - self.current_stack_depth)
             asm.bge(macros.t0, macros.t1, l_end)
             
         self._compile_node(body)
                 
         if range_var:
             var_info = self.get_symbol(range_var)
-            asm.load(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
+            asm.lw(macros.t0, macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth)
             asm.addi(macros.t0, macros.t0, 1)
-            asm.store(macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth, macros.t0)
-            
+            asm.sw(macros.stack_ptr, var_info.offset_from_base - self.current_stack_depth, macros.t0)
+          
         asm.jal(macros.x0, l_start)
         asm.label(l_end)
         
@@ -512,7 +537,7 @@ class Compiler:
             return self._evaluate_comptime(node.left)
         raise ValueError("Space slice [:expr] must be a compile-time constant.")
     
-    def _compile_expr(self, node: ExprNode):
+    def _compile_expr(self, node: ExprNode, expected_type=None):
         match node.type:
             case ExprNodeType.Macro:
                 macro_name = node.value.value
@@ -526,14 +551,14 @@ class Compiler:
                     asm.jal(macros.t0, skip_label)
                     
                     asm.code.extend(data)
-                    padding = (4 - (len(data) % 4)) % 4
+                    padding = (asm.REGISTER_SIZE - (len(data) % asm.REGISTER_SIZE)) % asm.REGISTER_SIZE
                     if padding > 0:
                         asm.code.extend(b'\x00' * padding)
                         
                     asm.label(skip_label)
                     
                     macros.push(macros.t0)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     return None
                     
                 elif macro_name == "import":
@@ -545,7 +570,7 @@ class Compiler:
                     args =[]
                     
                     reg_map = macros.reg_map
-                    no_rd_instructions = {"store", "bge", "beq", "bne", "ecall"}
+                    no_rd_instructions = {"store", "sw", "sb", "bge", "beq", "bne", "ecall"}
                     has_rd = inst_name not in no_rd_instructions
                     
                     temp_pool =[6, 7, 11, 12, 13, 14]
@@ -577,7 +602,7 @@ class Compiler:
                             if is_output:
                                 if not sym:
                                     macros.push(macros.x0)
-                                    self.current_stack_depth += 4
+                                    self.current_stack_depth += asm.REGISTER_SIZE
                                     sym = self.declare_symbol(name, type_name=type_name)
                                 elif type_name and not sym.type_name:
                                     sym.type_name = type_name
@@ -604,20 +629,17 @@ class Compiler:
                         asm.store(macros.stack_ptr, offset, macros.t0) 
                     
                     macros.push(rd_reg_to_push)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     return None
                 else:
                     raise SyntaxError(f"Unknown macro @{macro_name}")
 
             case ExprNodeType.Value:
                 macros.push_value(node.value.value)
-                self.current_stack_depth += 4
+                self.current_stack_depth += asm.REGISTER_SIZE
                 
             case ExprNodeType.Deref:
-                self._compile_expr(node.left)
-                macros.pop(macros.t0) 
-                asm.load(macros.t1, macros.t0, 0)
-                macros.push(macros.t1)
+                return self.Deref(node, expected_type)
                 
             case ExprNodeType.Identifier:
                 var_name = node.value.value
@@ -633,7 +655,7 @@ class Compiler:
                     if base_name in self.types and field_name in self.types[base_name].get("statics", {}):
                         val = self.types[base_name]["statics"][field_name]
                         macros.push_value(val)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         return None
                         
                     # 2. Instance Memory Read
@@ -645,11 +667,11 @@ class Compiler:
                         offset_val = self.types[sym.type_name]["fields"][field_name]
                         ptr_offset = (sym.offset_from_base - self.current_stack_depth)
                         
-                        asm.load(macros.t0, macros.stack_ptr, ptr_offset)
-                        asm.load(macros.t1, macros.t0, offset_val)        
+                        asm.lw(macros.t0, macros.stack_ptr, ptr_offset)
+                        asm.lw(macros.t1, macros.t0, offset_val)        
                         
                         macros.push(macros.t1)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         return None
                         
                     raise ValueError(f"Cannot read field '{field_name}' on '{base_name}'")
@@ -660,10 +682,11 @@ class Compiler:
                     raise ValueError(f"Undefined variable: {var_name}")
                 
                 offset = (sym.offset_from_base - self.current_stack_depth) 
-                asm.load(macros.t0, macros.stack_ptr, offset) 
+                asm.lw(macros.t0, macros.stack_ptr, offset) 
                 macros.push(macros.t0)
-                self.current_stack_depth += 4
+                self.current_stack_depth += asm.REGISTER_SIZE
                 return sym.type_name
+
 
             case ExprNodeType.BinaryOp:
                 left_type = self._compile_expr(node.left)
@@ -679,34 +702,34 @@ class Compiler:
                         self._compile_expr(node.right)
                         macros.pop(macros.t1) 
                         macros.pop(macros.t0) 
-                        self.current_stack_depth -= 8
+                        self.current_stack_depth -= asm.REGISTER_SIZE*2
                         
                         asm.addi(macros.t2, macros.ra, 0)
                         macros.push(macros.t2)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         
                         macros.push(macros.t0)
                         macros.push(macros.t1)
-                        self.current_stack_depth += 8
+                        self.current_stack_depth += asm.REGISTER_SIZE*2
                         
                         asm.jal(macros.ra, func_name)
                         asm.addi(macros.t2, macros.a0, 0)
                         
                         macros.pop(macros.x0)
                         macros.pop(macros.x0)
-                        self.current_stack_depth -= 8
+                        self.current_stack_depth -= asm.REGISTER_SIZE*2
                         
                         macros.pop(macros.ra)
-                        self.current_stack_depth -= 4
+                        self.current_stack_depth -= asm.REGISTER_SIZE
                         
                         macros.push(macros.t2)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         return left_type 
                     
                 self._compile_expr(node.right)
                 macros.pop(macros.t1)
                 macros.pop(macros.t0)
-                self.current_stack_depth -= 8
+                self.current_stack_depth -= asm.REGISTER_SIZE*2
                 
                 if op_sym == "+":
                     asm.add(macros.t0, macros.t0, macros.t1)
@@ -732,7 +755,7 @@ class Compiler:
                     raise SyntaxError(f"operand definition for {op_sym} was not found")
                 
                 macros.push(macros.t0)
-                self.current_stack_depth += 4
+                self.current_stack_depth += asm.REGISTER_SIZE
 
             case ExprNodeType.Call:
                 func_name = node.value.value
@@ -754,7 +777,7 @@ class Compiler:
                         
                         asm.addi(macros.t0, macros.ra, 0)
                         macros.push(macros.t0)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         
                         for arg in node.children:
                             self._compile_expr(arg)
@@ -764,13 +787,13 @@ class Compiler:
                         
                         for _ in node.children:
                              macros.pop(macros.x0) 
-                             self.current_stack_depth -= 4
+                             self.current_stack_depth -= asm.REGISTER_SIZE
                         
                         macros.pop(macros.ra)
-                        self.current_stack_depth -= 4
+                        self.current_stack_depth -= asm.REGISTER_SIZE
                         
                         macros.push(macros.t2)
-                        self.current_stack_depth += 4
+                        self.current_stack_depth += asm.REGISTER_SIZE
                         
                         sym = self.get_symbol(real_func_name)
                         if sym and sym.return_type:
@@ -792,12 +815,12 @@ class Compiler:
                     
                     asm.addi(macros.t0, macros.ra, 0)
                     macros.push(macros.t0)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     
                     offset = (sym.offset_from_base - self.current_stack_depth)
-                    asm.load(macros.t0, macros.stack_ptr, offset)
+                    asm.lw(macros.t0, macros.stack_ptr, offset)
                     macros.push(macros.t0)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     
                     for arg in node.children:
                         self._compile_expr(arg)
@@ -808,13 +831,13 @@ class Compiler:
                     # Pop arguments + instance pointer
                     for _ in range(len(node.children) + 1):
                          macros.pop(macros.x0) 
-                         self.current_stack_depth -= 4
+                         self.current_stack_depth -= asm.REGISTER_SIZE
                     
                     macros.pop(macros.ra)
-                    self.current_stack_depth -= 4
+                    self.current_stack_depth -= asm.REGISTER_SIZE
                     
                     macros.push(macros.t2)
-                    self.current_stack_depth += 4
+                    self.current_stack_depth += asm.REGISTER_SIZE
                     return None
 
             case ExprNodeType.ArrayAlloc:
@@ -837,4 +860,4 @@ class Compiler:
                 
                 # Push the start pointer to the stack (so it points to the beginning of the newly allocated space)
                 macros.push(macros.t0)
-                self.current_stack_depth += 4
+                self.current_stack_depth += asm.REGISTER_SIZE

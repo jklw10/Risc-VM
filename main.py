@@ -33,23 +33,35 @@ Data Movement (:) vs. Mutation (=):
      it is "is", "res = 4"
 
 The Universal Pipeline Construct: 
-   Control flow, loops, functions, and type definitions are all Pipelines.
-   Format: `(bindings) : { body } : return_val`
+   There is syntactically no distinction between functions, loops, namespaces, 
+   and type definitions. They are all structural variants of a Universal Pipeline.
+   Format: `return = (bindings) : { body } `
 
+   
+Data-Driven Control Flow (Zero-Keyword Branching):
+   The language contains ZERO native control flow keywords (`if`, `while`, `else`).
+   Conditional branching is an emergent property of temporal pipelines (loops). 
+   An "if statement" is simply a loop pipeline constrained to execute 0 or 1 times 
+   based on a dynamic truth condition (e.g., `( c = 0 : condition ) : { ... }`).
+   
 Pre-Declaration & Zero-Initialization:
    Declaring a typed variable at a block boundary (e.g., `res[int] = ... : { }`) 
    allocates and zero-initializes it in the outer scope, allowing inner 
    blocks to mutate it explicitly without scope-popping issues.
 
-Zero-Overhead Inline Assembly:
-   `@asm(...)` seamlessly bridges high-level code and RISC-V assembly, 
-   automatically resolving local variable stack offsets and register pooling.
+Raw Memory & Unsafe Transparency:
+   The language operates as an ultra-high-level macro assembler. Direct 
+   memory dereferencing (`[ptr]`), pointer arithmetic, and transparent 
+   bridging to CPU registers via `@asm` are first-class workflows. Strings 
+   do not exist natively; they are treated strictly as memory slices or 
+   embedded binaries.
 
 Explicit mutation:
   No hidden mutations, aka no side effects without visibility
 
 Caller is responsible for allocation.
 A pipeline's only purpose is to transform data.
+Aim to be rid of all keywords.
 """
 
 def load_cpu_lib():
@@ -123,20 +135,21 @@ def run_program(lib, RiscVState, filepath):
         cpu_state.memory[i] = byte
         
     cycles = 0
-    
+    cpu_state.memory[65000] = 255 # Initialize with a dummy flag
+
     # Run loop
-    while not cpu_state.halt and cycles < 1000:
+    while not cpu_state.halt and cycles < 100000:
         lib.run_cycles(ctypes.byref(cpu_state), 1)
         cycles += 1
         
         # Check simulated Memory-Mapped I/O at address 65000
         # Because we do word-stores (4 bytes), byte 65000 gets the integer value.
         val = cpu_state.memory[65000]
-        if val != 0:
+        if val != 255:
             print(f"[{cycles} cycles] Pixel ON! -> Memory[65000] received value: {val}")
             
             # Reset pixel so we can catch subsequent writes
-            cpu_state.memory[65000] = 0
+            cpu_state.memory[65000] = 255
 
     print(f"\nExecution finished in {cycles} cycles.")
     print(f"Final SP (x2): 0x{cpu_state.regs[2]:08x}")

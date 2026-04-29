@@ -1,6 +1,3 @@
-// ==========================================
-// 1. TYPE DEFINITIONS & OPERATOR OVERLOADING
-// ==========================================
 
 // Define the 'int' type as a 4-byte slice of memory
 int : value = (bytes[:4]) : {

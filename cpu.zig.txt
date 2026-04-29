@@ -5,7 +5,7 @@ const std = @import("std");
 pub const CpuState = extern struct {
     regs: [32]u32, // x0-x31
     pc: u32, // Program Counter
-    memory:[65536]u8, // 64KB RAM
+    memory: [65536]u8, // 64KB RAM
     halted: bool, // Triggered by specific instruction (e.g., ECALL)
 };
 // Extract opcode (lowest 7 bits)
@@ -92,7 +92,7 @@ export fn run_cycles(cpu: *CpuState, cycles: u32) void {
     for (0..cycles) |_| {
         if (cpu.halted) break;
         step(cpu);
-        cpu.regs[0] = 0; // x0 is hardwired to 0
+        cpu.regs[0] = 0;
     }
 }
 // --- 5. CORE EXECUTION LOGIC ---
@@ -200,11 +200,7 @@ fn step(cpu: *CpuState) void {
                 4 => { // LBU (Load Byte Unsigned)
                     cpu.regs[dest] = cpu.memory[addr];
                 },
-                5 => { // LHU (Load Halfword Unsigned)
-                    const v0 = cpu.memory[addr];
-                    const v1 = cpu.memory[(addr + 1) & 0xFFFF];
-                    cpu.regs[dest] = @as(u32, v0) | (@as(u32, v1) << 8);
-                },
+                // ... LH unsigned (5)
                 else => {},
             }
         },
@@ -260,11 +256,9 @@ fn step(cpu: *CpuState) void {
 
         // --- 7. JUMP AND LINK REGISTER (JALR) ---
         0x67 => {
-            const dest = registerDestination(inst);
+            cpu.regs[registerDestination(inst)] = cpu.pc + 4;
             // JALR target is (rs1 + imm) with LSB masked to 0
-            // Ensure target is evaluated *before* possibly overwriting rs1 
             const target = (cpu.regs[registerSource1(inst)] +% imm_i(inst)) & 0xFFFFFFFE;
-            cpu.regs[dest] = cpu.pc + 4;
             next_pc = target;
         },
 
@@ -288,44 +282,25 @@ fn step(cpu: *CpuState) void {
 
                 // Syscall 2: WRITE (write `a2` bytes from VM memory at address `a1` to stdout)
                 2 => {
-                    const start: usize = a1;
-                    const len: usize = a2;
                     // Safety check to ensure VM doesn't read out of bounds
-                    if (start + len <= cpu.memory.len) {
-                        const Io = std.Io;
-                        var threaded: Io.Threaded = .init_single_threaded;
-                        const io = threaded.io();
-                        
-                        const slice = cpu.memory[start .. start + len];
-                        
-                        // writeStreamingAll takes a direct byte slice `[]const u8`
-                        Io.File.stdout().writeStreamingAll(io, slice) catch |err| {
-                            std.debug.print("VM IO Error: {any}\n", .{err});
+                    if (a1 + a2 <= cpu.memory.len) {
+                        const stdout = std.fs.File.stdout().writer();
+                        const slice = cpu.memory[a1 .. a1 + a2];
+                        stdout.writeAll(slice) catch |err| {
+                            std.debug.print("VM IO Error: {}\n", .{err});
                         };
                     }
                 },
 
                 // Syscall 3: OPEN FILE / READ FILE
                 3 => {
-                    const start: usize = a1;
-                    const len: usize = a2;
                     // Safety check to ensure VM doesn't read out of bounds
-                    if (start + len <= cpu.memory.len) {
-                        const Io = std.Io;
-                        var threaded: Io.Threaded = .init_single_threaded;
-                        const io = threaded.io();
-                        
-                        // slice is const, but points to mutable memory ([]u8)
-                        const slice = cpu.memory[start .. start + len];
-                        
-                        // readStreaming takes an array of slices `[]const []u8`
-                        const iovecs = [_][]u8{slice};
-                        if (Io.File.stdin().readStreaming(io, &iovecs)) |bytes_read| {
-                            cpu.regs[10] = @as(u32, @intCast(bytes_read));
-                        } else |err| {
-                            std.debug.print("VM IO Error: {any}\n", .{err});
-                            cpu.regs[10] = 0;
-                        }
+                    if (a1 + a2 <= cpu.memory.len) {
+                        const stdout = std.fs.File.stdin.writer();
+                        const slice = cpu.memory[a1 .. a1 + a2];
+                        stdin.readAll(slice) catch |err| {
+                            std.debug.print("VM IO Error: {}\n", .{err});
+                        };
                     }
                 },
                 else => {
