@@ -4,13 +4,12 @@ from macros import asm
 from AST import NodeType, ASTNode
 from expression import ExprNodeType, ExprNode
 from typing import Dict, Optional, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tokens import Symbol
 from tokens import Identifier, Value
 import tokens
 import AST
 import expression
-
 @dataclass
 class SymbolInfo:
     offset_from_base: int  
@@ -24,6 +23,9 @@ class SymbolInfo:
     var_offset: int = 0
     type_name: str = "" 
     return_type: str = ""
+    
+    variants: list = field(default_factory=list) # Stores all overload AST nodes
+    is_compiled: bool = False                    # Prevents double-compilation
 
 class Compiler:
     def __init__(self):
@@ -111,6 +113,14 @@ class Compiler:
         if diff > 0:
             asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
             self.current_stack_depth = start_depth
+            
+        # Compile any functions declared locally in this block
+        funcs = {k:v for k,v in self.scopes[-1].items() if v.is_function and not getattr(v, 'is_compiled', False)}
+        if funcs:
+            skip_lbl = self.get_unique_label("skip_funcs")
+            asm.jal(macros.x0, skip_lbl) # Jump over the function bodies
+            self._compile_scope_functions(funcs)
+            asm.label(skip_lbl)
             
         self.exit_scope()
     
@@ -230,13 +240,20 @@ class Compiler:
                 func_name = f"__{type_name}_{method_name}"
                 self.types[type_name]["methods"][method_name] = func_name
                 
-            sym = self.get_symbol(func_name)
+            # Only check the LOCAL scope so local overloads shadow global functions cleanly
+            sym = self.scopes[-1].get(func_name)
             if not sym:
                 sym = self.declare_symbol(func_name, is_fn=True)
             if outputs:
                 sym.return_type = outputs[0]["type"]
                 
-            self._compile_function_def(func_name, bindings, body, ret_node, outputs)
+            # Add this overload as a variant and delay compilation
+            sym.variants.append({
+                "bindings": bindings,
+                "body": body,
+                "ret_node": ret_node,
+                "outputs": outputs
+            })
             return
 
         # 3. Otherwise, it's a Runtime Loop / Temporal Pipeline!
@@ -384,67 +401,104 @@ class Compiler:
         for child in node.children:
             self._compile_node(child)
         asm.ecall()
+        self._compile_scope_functions(self.scopes[0])
 
-    def _compile_function_def(self, func_name: str, bindings: List[ASTNode], body: ASTNode, ret_node: ASTNode, outputs: list = None):
-        end_label = self.get_unique_label("end_func")
-        asm.jal(macros.x0, end_label)
-        
+    def _compile_scope_functions(self, scope_dict):
+        for name, sym in scope_dict.items():
+            if sym.is_function and sym.variants and not sym.is_compiled:
+                self._emit_multifunction_dispatcher(name, sym)
+                sym.is_compiled = True
+
+    def _emit_multifunction_dispatcher(self, func_name: str, sym: SymbolInfo):
         asm.label(func_name)
         old_depth = self.current_stack_depth
         self.current_stack_depth = 0  
-        self.enter_scope()
-
+        
         # Temporarily clear context so we are compiling a runtime method body
         old_type_ctx = getattr(self, 'current_type_context', None)
         old_blueprint_ctx = getattr(self, 'current_blueprint_context', None)
         self.current_type_context = None
         self.current_blueprint_context = None
-        
-        arg_offset = -asm.REGISTER_SIZE
-        for i in reversed(range(len(bindings))):
-            binding = bindings[i]
-            info = SymbolInfo(
-                offset_from_base=arg_offset, 
-                is_function=False, 
-                arg_count=0,
-                type_name=getattr(binding, "type_name", "")
-            )
-            self.scopes[-1][binding.identifier] = info
-            arg_offset -= asm.REGISTER_SIZE
 
-        # Automatically Allocate & Zero-Initialize Output Arguments
-        if outputs:
-            for out in outputs:
-                if out["name"]:
-                    macros.push(macros.x0)
-                    self.current_stack_depth += asm.REGISTER_SIZE
-                    sym = self.declare_symbol(out["name"], type_name=out["type"])
-                    sym.return_type = out["type"]
+        for idx, variant in enumerate(sym.variants):
+            bindings = variant["bindings"]
+            body = variant["body"]
+            ret_node = variant["ret_node"]
+            outputs = variant["outputs"]
+            
+            next_variant_lbl = self.get_unique_label(f"next_var_{func_name}")
+            
+            self.enter_scope()
+            
+            # Setup argument mappings from the caller's stack
+            arg_offset = -asm.REGISTER_SIZE
+            for i in reversed(range(len(bindings))):
+                binding = bindings[i]
+                info = SymbolInfo(
+                    offset_from_base=arg_offset, 
+                    is_function=False, 
+                    arg_count=0,
+                    type_name=getattr(binding, "type_name", "")
+                )
+                self.scopes[-1][binding.identifier] = info
+                arg_offset -= asm.REGISTER_SIZE
 
-        for child in body.children:
-            self._compile_node(child)
+            # -------------------------------------------------------------
+            # PATTERN MATCHING: Check all constraints (e.g. x==1)
+            # -------------------------------------------------------------
+            for binding in bindings:
+                if binding.expr:
+                    self._compile_expr(binding.expr)
+                    macros.pop(macros.t0)
+                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    # If the condition evaluated to 0 (False), Jump to the next Variant!
+                    asm.beq(macros.t0, macros.x0, next_variant_lbl)
+
+            # --- If we made it here, the Pattern Matched! ---
+
+            # Automatically Allocate Output Arguments
+            if outputs:
+                for out in outputs:
+                    if out["name"]:
+                        macros.push(macros.x0)
+                        self.current_stack_depth += asm.REGISTER_SIZE
+                        out_sym = self.declare_symbol(out["name"], type_name=out["type"])
+                        out_sym.return_type = out["type"]
+
+            # Compile Body
+            for child in body.children:
+                self._compile_node(child)
+                
+            if ret_node:
+                self._compile_expr(ret_node.children[0].expr)
+                macros.pop(macros.t0)
+                self.current_stack_depth -= asm.REGISTER_SIZE  
+                asm.addi(macros.a0, macros.t0, 0)
+            else:
+                asm.addi(macros.a0, macros.x0, 0)
+                
+            if self.current_stack_depth > 0:
+                asm.addi(macros.stack_ptr, macros.stack_ptr, -self.current_stack_depth)
+                
+            # Exit Function!
+            asm.jalr(macros.x0, macros.ra, 0)
+                
+            self.exit_scope()
+            self.current_stack_depth = 0 # Reset depth for the next variant block
             
-        if ret_node:
-            self._compile_expr(ret_node.children[0].expr)
-            macros.pop(macros.t0)
-            
-            self.current_stack_depth -= asm.REGISTER_SIZE  
-            asm.addi(macros.a0, macros.t0, 0)
-        else:
-            asm.addi(macros.a0, macros.x0, 0)
-            
-        if self.current_stack_depth > 0:
-            asm.addi(macros.stack_ptr, macros.stack_ptr, -self.current_stack_depth)
-        asm.jalr(macros.x0, macros.ra, 0)
-            
-        self.exit_scope()
+            # Label for the next variant fallback
+            asm.label(next_variant_lbl)
+
+        # -------------------------------------------------------------
+        # PANIC: If execution falls down here, NO variants matched!
+        # -------------------------------------------------------------
+        #TODO sanitycheck, do i even want to crash here?
+        asm.ecall()
+
+        # Restore contexts
         self.current_stack_depth = old_depth
-
-        # Restore context 
         self.current_type_context = old_type_ctx
         self.current_blueprint_context = old_blueprint_ctx
-
-        asm.label(end_label)
 
     def _compile_loop(self, name, bindings, body, loop_type_name=""):
         out_sym = self.get_symbol(name)
@@ -840,6 +894,32 @@ class Compiler:
                     self.current_stack_depth += asm.REGISTER_SIZE
                     return None
 
+                # 3. Global / Local Function Call
+                sym = self.get_symbol(func_name)
+                if sym and sym.is_function:
+                    asm.addi(macros.t0, macros.ra, 0)
+                    macros.push(macros.t0)
+                    self.current_stack_depth += asm.REGISTER_SIZE
+                    
+                    for arg in node.children:
+                        self._compile_expr(arg)
+                        
+                    asm.jal(macros.ra, func_name)
+                    asm.addi(macros.t2, macros.a0, 0) 
+                    
+                    for _ in node.children:
+                         macros.pop(macros.x0) 
+                         self.current_stack_depth -= asm.REGISTER_SIZE
+                    
+                    macros.pop(macros.ra)
+                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    
+                    macros.push(macros.t2)
+                    self.current_stack_depth += asm.REGISTER_SIZE
+                    return sym.return_type
+
+                if "." not in func_name:
+                    raise ValueError(f"Undefined function '{func_name}'")
             case ExprNodeType.ArrayAlloc:
                 if node.left:
                     size = self._evaluate_comptime(node.left)

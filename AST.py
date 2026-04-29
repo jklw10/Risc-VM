@@ -230,6 +230,8 @@ class ASTParser:
                 self.current_node.children.append(node)
                 expr_tokens = []
                 while self.i < len(self.tokens) and self.tokens[self.i] != Symbol(";"):
+                    if self.tokens[self.i] == Symbol("}"):
+                        break
                     expr_tokens.append(self.tokens[self.i])
                     self.i += 1
                 if expr_tokens:
@@ -309,9 +311,9 @@ class ASTParser:
     def parse_binding(self, name_toks, expr_toks) -> ASTNode:
         node = ASTNode(NodeType.Binding)
         
-        if len(name_toks) == 1 and isinstance(name_toks[0], Identifier):
-            node.identifier = name_toks[0].value
-        elif len(name_toks) >= 4 and isinstance(name_toks[0], Identifier) and name_toks[1] == Symbol("["):
+        is_array_type_decl = (len(name_toks) >= 4 and isinstance(name_toks[0], Identifier) and name_toks[1] == Symbol("["))
+        
+        if is_array_type_decl:
             node.identifier = name_toks[0].value
             if name_toks[2] == Symbol(":"): 
                 node.is_type = True
@@ -319,7 +321,12 @@ class ASTParser:
             else: 
                 if isinstance(name_toks[2], Identifier):
                     node.type_name = name_toks[2].value
-                    
+        elif len(name_toks) >= 1 and isinstance(name_toks[0], Identifier):
+            node.identifier = name_toks[0].value
+            # If the parameter has trailing tokens (e.g. `x == 1`), it's a Pattern Match Constraint!
+            if len(name_toks) > 1:
+                node.expr = expression.parse_expression(name_toks)
+                
         if expr_toks:
             node.expr = expression.parse_expression(expr_toks)
             
@@ -383,6 +390,8 @@ class ASTParser:
             k = j + 1
             val_tokens =[]
             while k < len(self.tokens) and self.tokens[k] != Symbol(";"):
+                if self.tokens[k] == Symbol("}"):
+                    break
                 val_tokens.append(self.tokens[k])
                 k += 1
                 
@@ -403,6 +412,8 @@ class ASTParser:
             
         val_tokens =[]
         while k < len(self.tokens) and self.tokens[k] != Symbol(";"):
+            if self.tokens[k] == Symbol("}"):
+                break
             val_tokens.append(self.tokens[k])
             k += 1
         
