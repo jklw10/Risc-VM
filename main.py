@@ -59,6 +59,15 @@ Raw Memory & Unsafe Transparency:
 Explicit mutation:
   No hidden mutations, aka no side effects without visibility
 
+Pattern matching via multifunction:
+  If a binding has x==value, it is now a pattern to match
+  eg.
+  match = {
+    case:result = (x==1, y): {result = y*2}
+    case:result = (x, y): {result = y}
+  }
+  match.case(0,1)
+
 Caller is responsible for allocation.
 A pipeline's only purpose is to transform data.
 Aim to be rid of all keywords.
